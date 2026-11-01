@@ -302,6 +302,12 @@ final class AudioDeviceRoute {
     /// 开关当前状态。
     var autoRouteEnabled: Bool { store.autoRouteInput }
 
+    /// 系统默认输入此刻是否就是虚拟设备。
+    ///
+    /// 微信输入法没有自己的麦克风设置项时靠它判断录音来源，状态行用它
+    /// 提示「请把输入设备设为 vRemoteDr 2ch」。
+    var isTargetDefaultInput: Bool { isTarget(devices.defaultInput()) }
+
     /// 用户拨动开关。关掉时如果之前是我们接管的，立刻还回去；
     /// 打开时立即接管。
     func setAutoRoute(_ enabled: Bool) {

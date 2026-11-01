@@ -62,6 +62,9 @@ enum VoiceSessionSelfTest {
         let coordinator: X6SessionCoordinator
         var clock = Date(timeIntervalSince1970: 1_000)
         var triggerTapCount = 0
+        var triggerDownCount = 0
+        var triggerUpCount = 0
+        var spaceTapCount = 0
         var routeChanges = [Bool]()
         var openRequests = [(VoiceRemoteID, Bool)]()
         var closeRequestCount = 0
@@ -72,7 +75,8 @@ enum VoiceSessionSelfTest {
             initialState: DoubaoAudioStateMonitor.State = .inactive,
             usesDeviceListFallback: Bool = false,
             processObjectID: AudioObjectID? = 456,
-            pid: pid_t? = 123
+            pid: pid_t? = 123,
+            triggerStyle: VoiceTriggerStyle = .tapToggle
         ) {
             doubao = FakeDoubaoState(
                 state: initialState,
@@ -82,11 +86,18 @@ enum VoiceSessionSelfTest {
             )
             var routeSink: ((Bool) -> Void)?
             var triggerSink: (() -> Void)?
+            var downSink: (() -> Void)?
+            var upSink: (() -> Void)?
+            var spaceSink: (() -> Void)?
             var nowSink: (() -> Date)?
             coordinator = X6SessionCoordinator(
                 doubaoState: doubao,
                 setRemoteRouteActive: { routeSink?($0) },
                 triggerTap: { triggerSink?() },
+                triggerDown: { downSink?() },
+                triggerUp: { upSink?() },
+                spaceTap: { spaceSink?() },
+                triggerStyle: { triggerStyle },
                 now: { nowSink?() ?? Date(timeIntervalSince1970: 0) }
             )
             routeSink = { [weak self] active in
@@ -94,6 +105,15 @@ enum VoiceSessionSelfTest {
             }
             triggerSink = { [weak self] in
                 self?.triggerTapCount += 1
+            }
+            downSink = { [weak self] in
+                self?.triggerDownCount += 1
+            }
+            upSink = { [weak self] in
+                self?.triggerUpCount += 1
+            }
+            spaceSink = { [weak self] in
+                self?.spaceTapCount += 1
             }
             nowSink = { [weak self] in
                 self?.clock ?? Date(timeIntervalSince1970: 0)
@@ -117,6 +137,16 @@ enum VoiceSessionSelfTest {
 
         func advance(_ seconds: TimeInterval) {
             clock = clock.addingTimeInterval(seconds)
+        }
+
+        /// 假时钟和真实 RunLoop 一起前进。短按锁定用的是真实定时器，
+        /// 只推假时钟会让「等了多久」和「实际过了多久」对不上。
+        func wait(_ seconds: TimeInterval) {
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                advance(0.05)
+            }
         }
 
         func beginChromecastPress() {
@@ -170,6 +200,14 @@ enum VoiceSessionSelfTest {
         testUnreadableStateKeepsSession(checks)
         testMissingProcessObjectCloses(checks)
         testUnbindableProcessKeepsSession(checks)
+        testPushToTalkHoldsTriggerWhilePressed(checks)
+        testShortPressLatchesHandsFree(checks)
+        testLatchedPressEndsSession(checks)
+        testLongHoldInLatchingModeEndsSession(checks)
+        testLatchAbortsWhenInputNeverStarts(checks)
+        testForceCloseReleasesHeldTrigger(checks)
+        testPushToTalkDoesNotKeepMicrophoneOpen(checks)
+        testTriggerDefaultsFollowInputMethod(checks)
         testAudioRouteSwitchesInput(checks)
         testAudioRouteRestoresOnStop(checks)
         testAudioRouteSettlesLeftoverAfterCrash(checks)
@@ -435,6 +473,158 @@ enum VoiceSessionSelfTest {
         c.expect(
             h.coordinator.debugSnapshot.phase == "open",
             "running but unbindable Doubao keeps the session"
+        )
+    }
+
+    // MARK: - 微信输入法：长按说话 / 短按锁定
+
+    /// 长按说话：按下就把触发键按下去，松手立刻抬起。
+    private static func testPushToTalkHoldsTriggerWhilePressed(_ c: CheckContext) {
+        let h = Harness(triggerStyle: .pushToTalk)
+        h.beginChromecastPress()
+        h.doubao.emit(.active)
+        c.expect(h.triggerDownCount == 1, "push-to-talk presses the trigger once")
+        c.expect(h.triggerUpCount == 0, "trigger stays down while the key is held")
+        c.expect(h.coordinator.debugSnapshot.phase == "open", "held press opens the session")
+
+        h.advance(1.20)
+        h.endChromecastPress()
+        c.expect(h.triggerUpCount == 1, "release lifts the trigger")
+        c.expect(h.triggerTapCount == 0, "push-to-talk never taps")
+        c.expect(h.spaceTapCount == 0, "a long press never latches")
+        c.expect(h.coordinator.debugSnapshot.phase == "closing", "release closes the session")
+    }
+
+    /// 短按锁定：松手之后用一次空格把按住说话升级成免手扶。
+    private static func testShortPressLatchesHandsFree(_ c: CheckContext) {
+        let h = Harness(triggerStyle: .pushToTalkLatching)
+        h.beginChromecastPress()
+        h.doubao.emit(.active)
+        h.advance(0.15)
+        h.endChromecastPress()
+        c.expect(h.spaceTapCount == 0, "no space before the long-press window ends")
+        h.wait(0.70)
+        c.expect(h.spaceTapCount == 1, "short press sends one space to latch")
+        c.expect(h.triggerUpCount == 1, "latched session releases the trigger")
+        c.expect(h.coordinator.debugSnapshot.phase == "open", "latched session stays open")
+        c.expect(
+            h.openRequests.contains { $0.0 == .chromecast },
+            "latch re-opens the remote microphone for hands-free audio"
+        )
+    }
+
+    /// 锁定之后再按一次：按住触发键越过长按阈值再松开，结束录音。
+    private static func testLatchedPressEndsSession(_ c: CheckContext) {
+        let h = Harness(triggerStyle: .pushToTalkLatching)
+        h.beginChromecastPress()
+        h.doubao.emit(.active)
+        h.endChromecastPress()
+        h.wait(0.70)
+        c.expect(h.coordinator.debugSnapshot.phase == "open", "session is latched")
+        // 锁定后重新拉起的音频流不是「按下」动作。
+        h.coordinator.remoteAudioStarted(remote: .chromecast, reason: 0x00)
+        c.expect(
+            h.coordinator.debugSnapshot.phase == "open",
+            "host-requested stream does not close the latched session"
+        )
+
+        h.beginChromecastPress()
+        c.expect(h.coordinator.debugSnapshot.phase == "closing", "second press starts closing")
+        h.wait(0.60)
+        c.expect(h.triggerDownCount == 2, "close gesture presses the trigger again")
+        c.expect(h.triggerUpCount == 2, "close gesture releases the trigger")
+    }
+
+    /// 长按松手不能被当成短按，否则会以为按键卡住了。
+    private static func testLongHoldInLatchingModeEndsSession(_ c: CheckContext) {
+        let h = Harness(triggerStyle: .pushToTalkLatching)
+        h.beginChromecastPress()
+        h.doubao.emit(.active)
+        h.advance(1.40)
+        h.endChromecastPress()
+        c.expect(h.spaceTapCount == 0, "a long hold never latches")
+        c.expect(h.triggerUpCount == 1, "long hold releases the trigger")
+        c.expect(
+            h.coordinator.debugSnapshot.phase == "closing",
+            "long hold ends the session"
+        )
+    }
+
+    /// 输入法一直没开始录音：不要真的锁定，按键也不能留在按下状态。
+    private static func testLatchAbortsWhenInputNeverStarts(_ c: CheckContext) {
+        let h = Harness(triggerStyle: .pushToTalkLatching)
+        h.beginChromecastPress()
+        h.endChromecastPress()
+        h.wait(1.40)
+        c.expect(h.spaceTapCount == 0, "no space is sent when the input method is idle")
+        c.expect(h.triggerUpCount == 1, "aborted latch still releases the trigger")
+        c.expect(
+            h.coordinator.debugSnapshot.phase != "open",
+            "aborted latch never leaves a recording session"
+        )
+        c.expect(h.triggerDownCount == h.triggerUpCount, "no key is left pressed")
+    }
+
+    /// 任何退出路径都不能留下按住的键。
+    private static func testForceCloseReleasesHeldTrigger(_ c: CheckContext) {
+        let h = Harness(triggerStyle: .pushToTalk)
+        h.beginChromecastPress()
+        h.doubao.emit(.active)
+        h.coordinator.forceClose()
+        c.expect(h.triggerUpCount == 1, "force close releases the held trigger")
+        c.expect(h.triggerDownCount == h.triggerUpCount, "key state is balanced")
+    }
+
+    /// 长按说话不需要常驻麦克风：松手就结束。
+    private static func testPushToTalkDoesNotKeepMicrophoneOpen(_ c: CheckContext) {
+        let h = Harness(triggerStyle: .pushToTalk)
+        h.beginChromecastPress()
+        h.doubao.emit(.active)
+        h.advance(0.30)
+        h.endChromecastPress()
+        c.expect(
+            h.openRequests.isEmpty,
+            "a held press never requests a persistent stream"
+        )
+    }
+
+    /// 自动检测模式：触发键与触发方式跟着系统当前选中的输入法走，
+    /// 但用户自己选过的值不被覆盖。
+    private static func testTriggerDefaultsFollowInputMethod(_ c: CheckContext) {
+        let weType = { "com.tencent.inputmethod.wetype" }
+        let doubao = { "com.bytedance.inputmethod.doubaoime" }
+
+        c.expect(
+            InputTriggerKey.resolve(
+                configured: .option, host: .automatic, currentInputSource: weType
+            ) == .function,
+            "automatic host switches to Fn for WeChat input"
+        )
+        c.expect(
+            InputTriggerKey.resolve(
+                configured: .control, host: .automatic, currentInputSource: weType
+            ) == .control,
+            "an explicitly chosen trigger key is never overridden"
+        )
+        c.expect(
+            VoiceTriggerStyle.resolve(
+                configured: .tapToggle, host: .automatic, currentInputSource: weType
+            ) == .pushToTalkLatching,
+            "automatic host uses push-to-talk for WeChat input"
+        )
+        c.expect(
+            VoiceTriggerStyle.resolve(
+                configured: .pushToTalkLatching,
+                host: .automatic,
+                currentInputSource: doubao
+            ) == .tapToggle,
+            "switching back to Doubao restores tap toggle"
+        )
+        c.expect(
+            VoiceTriggerStyle.resolve(
+                configured: .pushToTalk, host: .automatic, currentInputSource: weType
+            ) == .pushToTalk,
+            "an explicitly chosen trigger style is never overridden"
         )
     }
 
@@ -714,8 +904,7 @@ enum VoiceSessionSelfTest {
         )
     }
 
-    private static func testAudioRouteManualRestoreWithoutHistory(_ c: CheckContext) {
-        // 自动切换关掉时不收养，模拟「用户手工选过虚拟设备、App 没有记录」。
+    private static func testAudioRouteManualRestoreWithoutHistory(_ c: CheckContext) {        // 自动切换关掉时不收养，模拟「用户手工选过虚拟设备、App 没有记录」。
         let devices = makeRouteDevices(input: virtualDriver)
         let store = FakeRouteStore(autoRouteInput: false)
         let route = AudioDeviceRoute(devices: devices, store: store)

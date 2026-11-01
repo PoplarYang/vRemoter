@@ -2,12 +2,17 @@ import AppKit
 import CoreAudio
 import Foundation
 
-/// Reads the input-method's real CoreAudio capture state.
+/// Reads the input method's real CoreAudio capture state.
 ///
 /// This is deliberately independent from the remote-button state machine.
-/// `kAudioProcessPropertyIsRunningInput` is the source of truth for whether
-/// Doubao is currently recording, and `kAudioProcessPropertyDevices` tells us
-/// which input device it actually opened.
+/// `kAudioProcessPropertyIsRunningInput` is the source of truth for whether the
+/// input method is currently recording, and `kAudioProcessPropertyDevices`
+/// tells us which input device it actually opened.
+///
+/// The class keeps its original name because every call site and test still
+/// refers to it as the input-method state source, but it now binds one CoreAudio
+/// process object per monitored input method (Doubao, WeChat Input Method, or
+/// both when the host is `automatic`).
 ///
 /// macOS 13 knows the audio process object and its PID but rejects
 /// `kAudioProcessPropertyIsRunningInput` with `'who?'` (the selector only
@@ -28,6 +33,25 @@ final class DoubaoAudioStateMonitor {
         let processObjectID: AudioObjectID?
         let inputDeviceIDs: [AudioDeviceID]
         let inputDeviceNames: [String]
+        /// 这份快照来自哪个输入法。`automatic` 同时监控两个输入法时，
+        /// 状态行要能说出「谁在录音」。
+        let hostBundleID: String?
+
+        init(
+            state: State,
+            pid: pid_t?,
+            processObjectID: AudioObjectID?,
+            inputDeviceIDs: [AudioDeviceID],
+            inputDeviceNames: [String],
+            hostBundleID: String? = nil
+        ) {
+            self.state = state
+            self.pid = pid
+            self.processObjectID = processObjectID
+            self.inputDeviceIDs = inputDeviceIDs
+            self.inputDeviceNames = inputDeviceNames
+            self.hostBundleID = hostBundleID
+        }
 
         var isRecording: Bool { state == .active }
 
@@ -36,29 +60,70 @@ final class DoubaoAudioStateMonitor {
                 ? "无"
                 : inputDeviceNames.joined(separator: "、")
         }
+
+        /// 输入法的短名，例如「豆包」「微信输入法」。
+        var hostTitle: String? {
+            hostBundleID.flatMap(VoiceInputHost.title(forBundleID:))
+        }
     }
 
-    private static let targetBundleID = "com.bytedance.inputmethod.doubaoime"
     private static let targetDeviceName = "vRemoteDr 2ch"
 
+    /// One CoreAudio process object per monitored input-method bundle ID.
+    private struct Binding {
+        let pid: pid_t
+        let objectID: AudioObjectID
+        /// nil 表示这个进程对象还没被探测过；true 表示
+        /// `kAudioProcessPropertyIsRunningInput` 可用，false 表示只能用
+        /// 输入设备列表推断。
+        var usesNative: Bool?
+    }
+
+    private struct HostRead {
+        let state: State
+        let deviceIDs: [AudioDeviceID]
+        let deviceNames: [String]
+        let usesNative: Bool
+    }
+
     private var started = false
-    private var processObjectID = AudioObjectID(kAudioObjectUnknown)
-    private var processPID: pid_t?
+    private var bindings = [String: Binding]()
+    private var monitoredBundleIDs = [String]()
+    /// 输入法在运行但还绑不上进程对象（例如刚启动）时的 pid，用于区分
+    /// 「输入法没开」和「读不到状态」。
+    private var runningUnboundPIDs = [String: pid_t]()
     private var lastSnapshot: Snapshot?
     private var pollTimer: Timer?
 
-    /// macOS 14.2+ answers `kAudioProcessPropertyIsRunningInput`; older systems
-    /// reject it with `'who?'`. Probed once per bind so the log states which
-    /// source the snapshot came from. `nil` until the first successful read.
-    private var usesInputRunningProperty: Bool?
+    /// 最近一次读取实际使用了哪条路径。macOS 14.2+ 一直是原生选择器；
+    /// 13.x 上则是设备列表回退。会话协调器据此决定是否需要二次确认。
+    private var lastReadUsedFallback = false
 
     private static let pollInterval: TimeInterval = 0.4
 
     var onSnapshotChanged: ((Snapshot) -> Void)?
 
-    /// True only while the input-device list is the state source, i.e. before
-    /// `kAudioProcessPropertyIsRunningInput` has ever answered.
-    var usesDeviceListFallback: Bool { usesInputRunningProperty == false }
+    /// True only while the input-device list is the state source, i.e. while
+    /// `kAudioProcessPropertyIsRunningInput` is unavailable on this system.
+    var usesDeviceListFallback: Bool { lastReadUsedFallback }
+
+    /// 正在录音的输入法；空闲时给出系统此刻选中的输入法。
+    var activeHostBundleID: String? { lastSnapshot?.hostBundleID }
+
+    var activeHostTitle: String? {
+        // 录音中就以录音的那个为准，否则看用户现在用的是哪个输入法。
+        if let snapshot = lastSnapshot, snapshot.isRecording,
+           let title = snapshot.hostTitle
+        {
+            return title
+        }
+        if let bundleID = InputSourceProbe.currentInputMethodBundleID(),
+           let host = VoiceInputHost.host(forBundleID: bundleID)
+        {
+            return host.shortTitle
+        }
+        return lastSnapshot?.hostTitle
+    }
 
     private lazy var processListListener: AudioObjectPropertyListenerBlock = {
         [weak self] _, _ in
@@ -86,7 +151,7 @@ final class DoubaoAudioStateMonitor {
             processListListener
         )
         if status != noErr {
-            print("[DOUBAO-STATE] 无法监听音频进程列表: \(Self.describe(status))")
+            print("[INPUT-STATE] 无法监听音频进程列表: \(Self.describe(status))")
         }
         refreshBindingAndPublish(force: true)
         startPolling()
@@ -110,7 +175,7 @@ final class DoubaoAudioStateMonitor {
         started = false
         pollTimer?.invalidate()
         pollTimer = nil
-        unbindProcessObject()
+        unbindAll()
 
         var address = Self.processListAddress
         AudioObjectRemovePropertyListenerBlock(
@@ -122,91 +187,115 @@ final class DoubaoAudioStateMonitor {
         lastSnapshot = nil
     }
 
-    /// Synchronous pre-event snapshot. The Option event tap calls this before
-    /// the key event reaches Doubao, so the returned value is the old state
-    /// that the Option press is about to toggle.
+    /// Synchronous pre-event snapshot. The event tap calls this before the key
+    /// event reaches the input method, so the returned value is the old state
+    /// that the trigger press is about to toggle.
     func snapshotNow() -> Snapshot {
-        refreshBindingIfNeeded()
+        refreshBindingsIfNeeded()
         return readCurrentSnapshot()
     }
 
     private func refreshBindingAndPublish(force: Bool) {
-        refreshBindingIfNeeded()
+        refreshBindingsIfNeeded()
         publishCurrentSnapshot(force: force)
     }
 
-    private func refreshBindingIfNeeded() {
-        let app = NSRunningApplication.runningApplications(
-            withBundleIdentifier: Self.targetBundleID
-        ).first { !$0.isTerminated }
-
-        guard let app else {
-            if processObjectID != kAudioObjectUnknown {
-                unbindProcessObject()
+    private func refreshBindingsIfNeeded() {
+        let wanted = AppStorage.voiceInputHost.bundleIDs
+        if wanted != monitoredBundleIDs {
+            if !monitoredBundleIDs.isEmpty {
+                print("[INPUT-STATE] 监听目标变更 \(monitoredBundleIDs) → \(wanted)")
             }
-            processPID = nil
-            return
+            unbindAll()
+            monitoredBundleIDs = wanted
         }
 
-        let pid = app.processIdentifier
-        let translated = Self.processObject(for: pid)
-        guard translated != kAudioObjectUnknown else {
-            if processObjectID != kAudioObjectUnknown {
-                unbindProcessObject()
+        var live = Set<String>()
+        for bundleID in monitoredBundleIDs {
+            guard let app = NSRunningApplication.runningApplications(
+                withBundleIdentifier: bundleID
+            ).first(where: { !$0.isTerminated }) else { continue }
+
+            let pid = app.processIdentifier
+            let objectID = Self.processObject(for: pid)
+            guard objectID != kAudioObjectUnknown else {
+                // 输入法在跑，但系统还没给它音频进程对象：记下 pid，
+                // 让「输入法没开」和「状态读不到」保持可区分。
+                runningUnboundPIDs[bundleID] = pid
+                continue
             }
-            processPID = pid
-            return
+            runningUnboundPIDs.removeValue(forKey: bundleID)
+
+            live.insert(bundleID)
+            if let existing = bindings[bundleID] {
+                if existing.objectID == objectID {
+                    continue
+                }
+                removeListeners(for: existing.objectID)
+            }
+            addListeners(for: objectID)
+            bindings[bundleID] = Binding(
+                pid: pid,
+                objectID: objectID,
+                usesNative: nil
+            )
+            print(
+                "[INPUT-STATE] 已绑定 \(bundleID) pid=\(pid) " +
+                "audioProcess=\(objectID)"
+            )
         }
 
-        guard translated != processObjectID else {
-            processPID = pid
-            return
+        for (bundleID, binding) in bindings where !live.contains(bundleID) {
+            removeListeners(for: binding.objectID)
+            bindings.removeValue(forKey: bundleID)
+            print("[INPUT-STATE] 已解绑 \(bundleID)")
         }
+    }
 
-        unbindProcessObject()
-        processObjectID = translated
-        processPID = pid
-
+    private func addListeners(for objectID: AudioObjectID) {
         var runningAddress = Self.runningInputAddress
         let runningStatus = AudioObjectAddPropertyListenerBlock(
-            translated,
+            objectID,
             &runningAddress,
             .main,
             inputStateListener
         )
-
         var devicesAddress = Self.inputDevicesAddress
         let devicesStatus = AudioObjectAddPropertyListenerBlock(
-            translated,
+            objectID,
             &devicesAddress,
             .main,
             inputStateListener
         )
-
         print(
-            "[DOUBAO-STATE] 已绑定 pid=\(pid) audioProcess=\(translated) " +
-            "listeners=\(Self.describe(runningStatus))/\(Self.describe(devicesStatus))"
+            "[INPUT-STATE] listeners object=\(objectID) " +
+            "\(Self.describe(runningStatus))/\(Self.describe(devicesStatus))"
         )
     }
 
-    private func unbindProcessObject() {
-        guard processObjectID != kAudioObjectUnknown else { return }
+    private func removeListeners(for objectID: AudioObjectID) {
         var runningAddress = Self.runningInputAddress
         AudioObjectRemovePropertyListenerBlock(
-            processObjectID,
+            objectID,
             &runningAddress,
             .main,
             inputStateListener
         )
         var devicesAddress = Self.inputDevicesAddress
         AudioObjectRemovePropertyListenerBlock(
-            processObjectID,
+            objectID,
             &devicesAddress,
             .main,
             inputStateListener
         )
-        processObjectID = AudioObjectID(kAudioObjectUnknown)
-        processPID = nil
+    }
+
+    private func unbindAll() {
+        for binding in bindings.values {
+            removeListeners(for: binding.objectID)
+        }
+        bindings.removeAll()
+        runningUnboundPIDs.removeAll()
     }
 
     private func publishCurrentSnapshot(force: Bool) {
@@ -215,7 +304,8 @@ final class DoubaoAudioStateMonitor {
         guard force || snapshot != lastSnapshot else { return }
         lastSnapshot = snapshot
         print(
-            "[DOUBAO-STATE] state=\(snapshot.state.rawValue) " +
+            "[INPUT-STATE] state=\(snapshot.state.rawValue) " +
+            "host=\(snapshot.hostTitle ?? "-") " +
             "pid=\(snapshot.pid.map(String.init) ?? "-") " +
             "devices=\(snapshot.deviceSummary)"
         )
@@ -223,7 +313,7 @@ final class DoubaoAudioStateMonitor {
            !snapshot.inputDeviceNames.contains(Self.targetDeviceName)
         {
             print(
-                "[DOUBAO-STATE] ⚠️ 豆包正在录音，但实际输入不是 " +
+                "[INPUT-STATE] ⚠️ 输入法正在录音，但实际输入不是 " +
                 Self.targetDeviceName
             )
         }
@@ -232,48 +322,106 @@ final class DoubaoAudioStateMonitor {
     }
 
     /// On 14.2+ the property listeners are enough, so the poll is retired as
-    /// soon as the native selector answers. Only the device-list fallback
-    /// needs it.
+    /// soon as every binding answers through the native selector. Only the
+    /// device-list fallback needs it.
     private func stopPollingIfNative() {
-        guard usesInputRunningProperty == true, pollTimer != nil else { return }
+        guard pollTimer != nil, !bindings.isEmpty else { return }
+        guard bindings.values.allSatisfy({ $0.usesNative == true }) else { return }
         pollTimer?.invalidate()
         pollTimer = nil
-        print("[DOUBAO-STATE] 原生状态可用 · 停止轮询")
+        print("[INPUT-STATE] 原生状态可用 · 停止轮询")
     }
 
     private func readCurrentSnapshot() -> Snapshot {
-        guard processObjectID != kAudioObjectUnknown else {
+        guard !bindings.isEmpty else {
             return Snapshot(
                 state: .unavailable,
-                pid: processPID,
+                pid: runningUnboundPIDs.values.first,
                 processObjectID: nil,
                 inputDeviceIDs: [],
-                inputDeviceNames: []
+                inputDeviceNames: [],
+                hostBundleID: nil
             )
         }
 
+        var firstBound: (String, Binding)?
+        var active: (String, Binding, HostRead)?
+        var firstRead: HostRead?
+
+        for bundleID in monitoredBundleIDs {
+            guard var binding = bindings[bundleID] else { continue }
+            if firstBound == nil {
+                firstBound = (bundleID, binding)
+            }
+            let read = read(binding: binding)
+            if binding.usesNative != read.usesNative {
+                binding.usesNative = read.usesNative
+                bindings[bundleID] = binding
+            }
+            if firstRead == nil {
+                firstRead = read
+                lastReadUsedFallback = !read.usesNative
+            }
+            if read.state == .active {
+                active = (bundleID, binding, read)
+                break
+            }
+        }
+
+        if let active {
+            let (bundleID, binding, read) = active
+            lastReadUsedFallback = !read.usesNative
+            return Snapshot(
+                state: .active,
+                pid: binding.pid,
+                processObjectID: binding.objectID,
+                inputDeviceIDs: read.deviceIDs,
+                inputDeviceNames: read.deviceNames,
+                hostBundleID: bundleID
+            )
+        }
+
+        guard let firstBound else {
+            return Snapshot(
+                state: .unavailable,
+                pid: runningUnboundPIDs.values.first,
+                processObjectID: nil,
+                inputDeviceIDs: [],
+                inputDeviceNames: [],
+                hostBundleID: nil
+            )
+        }
+        let (bundleID, binding) = firstBound
+        return Snapshot(
+            state: firstRead?.state ?? .unavailable,
+            pid: binding.pid,
+            processObjectID: binding.objectID,
+            inputDeviceIDs: firstRead?.deviceIDs ?? [],
+            inputDeviceNames: firstRead?.deviceNames ?? [],
+            hostBundleID: bundleID
+        )
+    }
+
+    private func read(binding: Binding) -> HostRead {
         // Preferred path: macOS 14.2+ reports capture state directly.
         if let running = Self.uint32Property(
-            object: processObjectID,
+            object: binding.objectID,
             selector: kAudioProcessPropertyIsRunningInput,
             scope: kAudioObjectPropertyScopeGlobal
         ) {
-            if usesInputRunningProperty != true {
-                usesInputRunningProperty = true
-                print("[DOUBAO-STATE] 使用 IsRunningInput 探测录音状态")
+            if binding.usesNative != true {
+                print("[INPUT-STATE] \(binding.pid) 使用 IsRunningInput 探测录音状态")
             }
             let deviceIDs = Self.objectListProperty(
-                object: processObjectID,
+                object: binding.objectID,
                 selector: kAudioProcessPropertyDevices,
                 scope: kAudioObjectPropertyScopeInput
             ) ?? []
-            let names = deviceIDs.map(Self.deviceName)
-            return Snapshot(
+            return HostRead(
                 state: running == 0 ? .inactive : .active,
-                pid: processPID,
-                processObjectID: processObjectID,
-                inputDeviceIDs: deviceIDs,
-                inputDeviceNames: names
+                deviceIDs: deviceIDs,
+                deviceNames: deviceIDs.map(Self.deviceName),
+                usesNative: true
             )
         }
 
@@ -281,32 +429,29 @@ final class DoubaoAudioStateMonitor {
         // still lists the input devices it currently holds open. The list is
         // empty while idle and contains the capture device while recording.
         if let deviceIDs = Self.objectListProperty(
-            object: processObjectID,
+            object: binding.objectID,
             selector: kAudioProcessPropertyDevices,
             scope: kAudioObjectPropertyScopeInput
         ) {
-            if usesInputRunningProperty != false {
-                usesInputRunningProperty = false
+            if binding.usesNative != false {
                 print(
-                    "[DOUBAO-STATE] IsRunningInput 不可用，改用输入设备列表探测"
+                    "[INPUT-STATE] \(binding.pid) IsRunningInput 不可用，" +
+                    "改用输入设备列表探测"
                 )
             }
-            let names = deviceIDs.map(Self.deviceName)
-            return Snapshot(
+            return HostRead(
                 state: deviceIDs.isEmpty ? .inactive : .active,
-                pid: processPID,
-                processObjectID: processObjectID,
-                inputDeviceIDs: deviceIDs,
-                inputDeviceNames: names
+                deviceIDs: deviceIDs,
+                deviceNames: deviceIDs.map(Self.deviceName),
+                usesNative: false
             )
         }
 
-        return Snapshot(
+        return HostRead(
             state: .unavailable,
-            pid: processPID,
-            processObjectID: processObjectID,
-            inputDeviceIDs: [],
-            inputDeviceNames: []
+            deviceIDs: [],
+            deviceNames: [],
+            usesNative: binding.usesNative ?? true
         )
     }
 

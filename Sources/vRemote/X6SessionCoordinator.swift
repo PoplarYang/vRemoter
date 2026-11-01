@@ -21,6 +21,10 @@ protocol DoubaoAudioStateProviding: AnyObject {
     /// See `usesDeviceListFallback` in the extension below.
     var usesDeviceListFallback: Bool { get }
 
+    /// Short name of the input method behind the current snapshot, so status
+    /// text reads「微信输入法录音中」instead of always naming Doubao.
+    var activeHostTitle: String? { get }
+
     func start()
     func stop()
     func snapshotNow() -> DoubaoAudioStateMonitor.Snapshot
@@ -33,6 +37,8 @@ extension DoubaoAudioStateProviding {
     /// which is the macOS 13 fallback. Everywhere else the state comes from
     /// `kAudioProcessPropertyIsRunningInput` and behaves as before.
     var usesDeviceListFallback: Bool { false }
+
+    var activeHostTitle: String? { nil }
 }
 
 /// Coordinates the input-method toggle, supported remote gestures, and each
@@ -75,10 +81,38 @@ final class X6SessionCoordinator {
     private static let maximumOpenAttempts = 3
     private static let startVerificationAttempts = 3
     private static let startVerificationInterval: TimeInterval = 1.0
+    /// 短按锁定：按住时间短于这个值才算「短按」，松手后升级成免手扶；
+    /// 超过它就是一次正常的「按住说完」。
+    private static let tapToLatchThreshold: TimeInterval = 0.7
+    /// 短按锁定：松开后至少按住这么久再发空格，越过微信输入法的长按
+    /// 待定窗口。待定窗口内的空格会被它跳过、直接打进文档。
+    private static let latchMinHold: TimeInterval = 0.5
+    /// 短按锁定：松开后等输入法真正开始录音的观察窗口。超过这个时间还没
+    /// 开始录音，说明没必要锁定，直接按普通短按收尾。
+    private static let latchStartTimeout: TimeInterval = 0.9
+    private static let latchStartProbeInterval: TimeInterval = 0.1
+    /// 锁定之后确认录音仍在继续的时间点（微信输入法会忽略无效的空格）。
+    private static let latchVerificationDelay: TimeInterval = 0.8
+    /// 从免手扶结束录音时，按住触发键越过微信输入法的长按阈值（它会把
+    /// 免手扶升级回按住说话），再松开才真正结束。
+    private static let latchReleaseHold: TimeInterval = 0.5
+
+    /// 合成按键当前处于哪一步。任何退出路径都必须把它清干净，否则用户
+    /// 的键盘上会残留一个按住的 Fn/Option。
+    private enum TriggerHoldState {
+        case idle
+        case holding(since: Date)
+        case latched
+        case closingGesture
+    }
 
     private let doubaoState: any DoubaoAudioStateProviding
     private let setRemoteRouteActive: (Bool) -> Void
     private let triggerTap: () -> Void
+    private let triggerDown: () -> Void
+    private let triggerUp: () -> Void
+    private let spaceTap: () -> Void
+    private let triggerStyleProvider: () -> VoiceTriggerStyle
     private let now: () -> Date
 
     private var phase: Phase = .closed
@@ -89,6 +123,11 @@ final class X6SessionCoordinator {
     private var streamingRemotes = Set<VoiceRemoteID>()
     private var openRequestedRemote: VoiceRemoteID?
     private var physicalVoiceGestures = [VoiceRemoteID: PhysicalVoiceGesture]()
+
+    private var triggerHold: TriggerHoldState = .idle
+    private var triggerWorkItem: DispatchWorkItem?
+    private var latchProbeWorkItem: DispatchWorkItem?
+    private var latchVerificationWorkItem: DispatchWorkItem?
 
     private var routeCloseWorkItem: DispatchWorkItem?
     private var startVerificationWorkItem: DispatchWorkItem?
@@ -109,11 +148,21 @@ final class X6SessionCoordinator {
             AudioPipe.shared.setRemoteActive($0)
         },
         triggerTap: @escaping () -> Void = { Key.triggerTap() },
+        triggerDown: @escaping () -> Void = { Key.triggerDown() },
+        triggerUp: @escaping () -> Void = { Key.triggerUp() },
+        spaceTap: @escaping () -> Void = { Key.spaceTap() },
+        triggerStyle: @escaping () -> VoiceTriggerStyle = {
+            VoiceTriggerStyle.resolve()
+        },
         now: @escaping () -> Date = Date.init
     ) {
         self.doubaoState = doubaoState
         self.setRemoteRouteActive = setRemoteRouteActive
         self.triggerTap = triggerTap
+        self.triggerDown = triggerDown
+        self.triggerUp = triggerUp
+        self.spaceTap = spaceTap
+        self.triggerStyleProvider = triggerStyle
         self.now = now
     }
 
@@ -143,7 +192,8 @@ final class X6SessionCoordinator {
     ) {
         let snapshot = doubaoState.snapshotNow()
         let inserted = streamingRemotes.insert(remote).inserted
-        if openRequestedRemote == remote {
+        let wasRequested = openRequestedRemote == remote
+        if wasRequested {
             openRequestedRemote = nil
             openConfirmationWorkItem?.cancel()
             openConfirmationWorkItem = nil
@@ -159,7 +209,16 @@ final class X6SessionCoordinator {
             return
         }
 
-        if supportsPhysicalHoldGesture, reason == 0x03 {
+        // 免手扶锁定期间再按一次语音键 = 结束。由宿主主动请求的音频流不算
+        // 按下动作，否则锁定后重新拉起麦克风会立刻把自己关掉。
+        if isLatched, !wasRequested, phase == .open || phase == .opening {
+            activateRemoteRoute()
+            print("[VOICE-SESSION] latched session: press begins close gesture")
+            beginClosing(sendTrigger: true, reason: "latched press")
+            return
+        }
+
+        if supportsPhysicalHoldGesture, !usesPushToTalk, reason == 0x03 {
             let recognitionWasOpen = phase == .open || snapshot.isRecording
             if physicalVoiceGestures[remote] == nil {
                 physicalVoiceGestures[remote] = PhysicalVoiceGesture(
@@ -202,7 +261,7 @@ final class X6SessionCoordinator {
 
         switch phase {
         case .opening, .open:
-            publish("豆包录音中 · 遥控器已接入")
+            publish("\(hostLabel)录音中 · 遥控器已接入")
 
         case .closed:
             // Chromecast reserves reason 0x03 for a physical voice press, so
@@ -251,6 +310,32 @@ final class X6SessionCoordinator {
             openConfirmationWorkItem = nil
         }
 
+        // 长按说话：遥控器松手（音频流结束）就是「说完了」。微信输入法的
+        // 录音时长与按键时长一致，不需要常驻麦克风。
+        if usesPushToTalk, case .holding = triggerHold,
+           phase == .opening || phase == .open
+        {
+            if let gesture = physicalVoiceGestures.removeValue(forKey: remote) {
+                print(
+                    String(
+                        format:
+                            "[VOICE-SESSION] push-to-talk release remote=%@ " +
+                            "duration=%.3fs",
+                        remote.rawValue,
+                        now().timeIntervalSince(gesture.beganAt)
+                    )
+                )
+            }
+            closeRecognitionFromRemote(reason: "push-to-talk release")
+            return
+        }
+
+        // 免手扶收尾时我们自己按着触发键，此时遥控器的松开事件没有意义。
+        if case .closingGesture = triggerHold {
+            print("[VOICE-SESSION] release ignored during latch close gesture")
+            return
+        }
+
         if reason == 0x02,
            let gesture = physicalVoiceGestures.removeValue(forKey: remote)
         {
@@ -296,7 +381,7 @@ final class X6SessionCoordinator {
                 bypassDebounce: true,
                 attempt: 1
             )
-            publish("豆包录音中 · 遥控器持续收音")
+            publish("\(hostLabel)录音中 · 遥控器持续收音")
             return
         }
 
@@ -310,7 +395,7 @@ final class X6SessionCoordinator {
         // it immediately before its HID toggle-off edge. Only the proven
         // Chromecast physical-tap path above performs an immediate recovery.
         if phase == .open || phase == .opening {
-            publish("豆包仍开启 · 遥控器音频已停止")
+            publish("\(hostLabel)仍开启 · 遥控器音频已停止")
         } else if streamingRemotes.isEmpty {
             scheduleRouteClose(after: 0.08)
         }
@@ -421,6 +506,7 @@ final class X6SessionCoordinator {
     func forceClose() {
         generation &+= 1
         cancelScheduledWork()
+        releaseAllTriggers()
         phase = .closed
         owner = .none
         sessionRemote = nil
@@ -457,11 +543,11 @@ final class X6SessionCoordinator {
                         attempt: 1
                     )
                 }
-                publish("豆包录音中 · \(snapshot.deviceSummary)")
+                publish("\(hostLabel)录音中 · \(snapshot.deviceSummary)")
 
             case .open:
                 activateRemoteRoute()
-                publish("豆包录音中 · \(snapshot.deviceSummary)")
+                publish("\(hostLabel)录音中 · \(snapshot.deviceSummary)")
 
             case .closing:
                 // CoreAudio can remain active briefly after the trigger has
@@ -495,13 +581,13 @@ final class X6SessionCoordinator {
                     closeRouteAndTransports()
                 }
             }
-            publish("豆包已就绪")
+            publish("\(hostLabel)已就绪")
 
         case .unavailable:
             if phase != .opening {
                 finalizeClosed(reason: "Doubao unavailable")
             }
-            publish("等待豆包输入法")
+            publish("等待\(hostLabel)")
         }
     }
 
@@ -525,7 +611,7 @@ final class X6SessionCoordinator {
                 attempt: 1
             )
         }
-        publish("豆包录音中 · \(snapshot.deviceSummary)")
+        publish("\(hostLabel)录音中 · \(snapshot.deviceSummary)")
     }
 
     // MARK: - State transitions
@@ -538,7 +624,7 @@ final class X6SessionCoordinator {
         sessionRemote = nil
         activateRemoteRoute()
         scheduleStartVerification(for: generation)
-        publish("豆包正在启动 · 等待遥控器")
+        publish("\(hostLabel)正在启动 · 等待遥控器")
     }
 
     private func beginOpening(
@@ -554,7 +640,7 @@ final class X6SessionCoordinator {
         sessionRemote = remote
         activateRemoteRoute()
         if sendTrigger {
-            triggerTap()
+            emitOpenTrigger()
         }
         if requestTransportImmediately {
             requestRemoteTransportOpen(
@@ -566,9 +652,200 @@ final class X6SessionCoordinator {
         scheduleStartVerification(for: generation)
         publish(
             owner == .keyboard
-                ? "豆包正在启动 · 遥控器已预热"
-                : "遥控器已启动 · 正在打开豆包"
+                ? "\(hostLabel)正在启动 · 遥控器已预热"
+                : "遥控器已启动 · 正在打开\(hostLabel)"
         )
+    }
+
+    // MARK: - Trigger emission
+
+    /// 当前生效的触发方式。默认值由 `VoiceTriggerStyle.resolve` 决定：用户
+    /// 显式选了长按就照做，否则按当前选中的输入法判断。
+    private var triggerStyle: VoiceTriggerStyle { triggerStyleProvider() }
+
+    private var usesPushToTalk: Bool { triggerStyle.usesPushToTalk }
+
+    private var usesLatching: Bool { triggerStyle == .pushToTalkLatching }
+
+    private var isLatched: Bool {
+        if case .latched = triggerHold { return true }
+        return false
+    }
+
+    /// 合成按键是否正被我们按着。长按说话、免手扶收尾都算。
+    private var isTriggerHeld: Bool {
+        switch triggerHold {
+        case .holding, .closingGesture: return true
+        case .idle, .latched: return false
+        }
+    }
+
+    /// 用户可见的输入法短名。
+    private var hostLabel: String {
+        doubaoState.activeHostTitle ?? AppStorage.voiceInputHost.shortTitle
+    }
+
+    private func emitOpenTrigger() {
+        guard usesPushToTalk else {
+            triggerTap()
+            return
+        }
+        guard case .idle = triggerHold else { return }
+        triggerDown()
+        triggerHold = .holding(since: now())
+        print("[TRIGGER] push-to-talk DOWN")
+    }
+
+    private func emitCloseTrigger() {
+        guard usesPushToTalk else {
+            triggerTap()
+            return
+        }
+        switch triggerHold {
+        case .holding:
+            triggerUp()
+            triggerHold = .idle
+            print("[TRIGGER] push-to-talk UP")
+
+        case .latched:
+            beginLatchedCloseGesture()
+
+        case .closingGesture:
+            break
+
+        case .idle:
+            // 物理键盘打开的会话：按键本身已经由系统送进输入法，
+            // 这里不再合成第二个按键。
+            print("[TRIGGER] no synthetic trigger to release")
+        }
+    }
+
+    /// 短按：等输入法真的开始录音后，用一次空格把按住说话升级成免手扶。
+    ///
+    /// 空格必须发在「已经开始录音」之后。微信输入法在长按待定窗口内会跳过
+    /// 空格（不消费），那一下会直接把空格打进用户正在编辑的文档。
+    private func beginShortPressLatch(since beganAt: Date) {
+        let elapsed = now().timeIntervalSince(beganAt)
+        let delay = max(0, Self.latchMinHold - elapsed)
+        scheduleLatchProbe(after: delay, beganAt: beganAt)
+    }
+
+    private func scheduleLatchProbe(after delay: TimeInterval, beganAt: Date) {
+        latchProbeWorkItem?.cancel()
+        let expectedGeneration = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == expectedGeneration else { return }
+            self.latchProbeWorkItem = nil
+            self.finishShortPressLatch(beganAt: beganAt)
+        }
+        latchProbeWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + max(0, delay),
+            execute: work
+        )
+    }
+
+    private func finishShortPressLatch(beganAt: Date) {
+        guard case .holding = triggerHold,
+              phase == .opening || phase == .open
+        else { return }
+
+        if doubaoState.snapshotNow().isRecording {
+            spaceTap()
+            triggerUp()
+            triggerHold = .latched
+            phase = .open
+            startVerificationWorkItem?.cancel()
+            startVerificationWorkItem = nil
+            print("[TRIGGER] hands-free latch ON")
+            publish("\(hostLabel)录音中 · 已锁定，再按一次结束")
+            // 免手扶期间遥控器已经松手，麦克风要重新拉起来，
+            // 否则锁定的只是 Mac 麦克风。
+            if let remote = sessionRemote, !streamingRemotes.contains(remote) {
+                requestRemoteTransportOpen(
+                    remote,
+                    bypassDebounce: true,
+                    attempt: 1
+                )
+            }
+            scheduleLatchVerification()
+            return
+        }
+
+        if now().timeIntervalSince(beganAt) < Self.latchStartTimeout {
+            scheduleLatchProbe(
+                after: Self.latchStartProbeInterval,
+                beganAt: beganAt
+            )
+            return
+        }
+
+        // 输入法始终没开始录音：按普通短按收尾，绝不留住一个按下的键。
+        print("[TRIGGER] 短按锁定放弃：输入法未开始录音")
+        triggerUp()
+        triggerHold = .idle
+        beginClosing(sendTrigger: false, reason: "latch aborted")
+    }
+
+    /// 免手扶到底有没有保持住。微信输入法遇到无效的空格会静默忽略，
+    /// 那就直接收尾，而不是留一个永远停不下来的会话。
+    private func scheduleLatchVerification() {
+        latchVerificationWorkItem?.cancel()
+        let expectedGeneration = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == expectedGeneration else { return }
+            self.latchVerificationWorkItem = nil
+            guard self.isLatched, self.phase == .open else { return }
+            guard self.doubaoState.snapshotNow().isRecording else {
+                print("[TRIGGER] hands-free latch lost · closing")
+                self.finalizeClosed(reason: "hands-free latch lost")
+                self.publish("\(self.hostLabel)已结束录音")
+                return
+            }
+            print("[TRIGGER] hands-free latch confirmed")
+        }
+        latchVerificationWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.latchVerificationDelay,
+            execute: work
+        )
+    }
+
+    /// 免手扶状态下结束录音：再按一次触发键并按住，微信输入法会把免手扶
+    /// 升级回按住说话，松手才真正结束。
+    private func beginLatchedCloseGesture() {
+        triggerDown()
+        triggerHold = .closingGesture
+        print("[TRIGGER] latched close gesture DOWN")
+        let expectedGeneration = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == expectedGeneration else { return }
+            self.triggerWorkItem = nil
+            guard case .closingGesture = self.triggerHold else { return }
+            self.triggerUp()
+            self.triggerHold = .idle
+            print("[TRIGGER] latched close gesture UP")
+        }
+        triggerWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.latchReleaseHold,
+            execute: work
+        )
+    }
+
+    /// 任何退出路径都必须调用：把按住的合成按键还回去。
+    private func releaseAllTriggers() {
+        latchProbeWorkItem?.cancel()
+        latchProbeWorkItem = nil
+        latchVerificationWorkItem?.cancel()
+        latchVerificationWorkItem = nil
+        triggerWorkItem?.cancel()
+        triggerWorkItem = nil
+        if isTriggerHeld {
+            triggerUp()
+            print("[TRIGGER] released held synthetic trigger")
+        }
+        triggerHold = .idle
     }
 
     private func closeRecognitionFromRemote(reason: String) {
@@ -590,17 +867,27 @@ final class X6SessionCoordinator {
             return
         }
 
+        // 「长按 + 短按锁定」模式下，确实是一次短按才升级成免手扶；按住
+        // 超过阈值再松手就是正常的「说完」，不能继续录。
+        if sendTrigger, usesLatching, case .holding(let beganAt) = triggerHold,
+           now().timeIntervalSince(beganAt) < Self.tapToLatchThreshold
+        {
+            print("[VOICE-SESSION] short press released → hands-free latch")
+            beginShortPressLatch(since: beganAt)
+            return
+        }
+
         generation &+= 1
         cancelScheduledWork()
         phase = .closing
         owner = .none
         openRequestedRemote = nil
         if sendTrigger {
-            triggerTap()
+            emitCloseTrigger()
         }
         scheduleRouteClose(after: 0.10)
         scheduleCloseVerification(for: generation)
-        publish("遥控器已结束 · 正在关闭豆包")
+        publish("遥控器已结束 · 正在关闭\(hostLabel)")
         print(
             "[VOICE-SESSION] begin closing reason=\(reason) " +
             "trigger=\(sendTrigger ? "synthetic" : "physical")"
@@ -610,6 +897,7 @@ final class X6SessionCoordinator {
     private func finalizeClosed(reason: String) {
         generation &+= 1
         cancelScheduledWork()
+        releaseAllTriggers()
         phase = .closed
         owner = .none
         sessionRemote = nil
@@ -793,7 +1081,7 @@ final class X6SessionCoordinator {
                 || snapshot.pid != nil
             guard snapshot.state == .unavailable, doubaoIsRunning else {
                 self.finalizeClosed(reason: "opening timeout")
-                self.publish("豆包未启动 · 遥控器自动关闭")
+                self.publish("\(self.hostLabel)未启动 · 遥控器自动关闭")
                 return
             }
             // The process object exists but this platform cannot report its
@@ -801,7 +1089,7 @@ final class X6SessionCoordinator {
             self.phase = .open
             self.activateRemoteRoute()
             print("[VOICE-SESSION] 豆包状态不可读 · 保持会话")
-            self.publish("豆包录音中 · 无法读取状态")
+            self.publish("\(self.hostLabel)录音中 · 无法读取状态")
         }
         startVerificationWorkItem = work
         DispatchQueue.main.asyncAfter(
@@ -833,13 +1121,13 @@ final class X6SessionCoordinator {
                         attempt: 1
                     )
                 }
-                self.publish("豆包仍在录音 · 请再次关闭")
+                self.publish("\(self.hostLabel)仍在录音 · 请再次关闭")
                 print(
                     "[VOICE-SESSION] close not observed; restored open state"
                 )
             } else {
                 self.finalizeClosed(reason: "close verification")
-                self.publish("豆包已就绪")
+                self.publish("\(self.hostLabel)已就绪")
             }
         }
         closeVerificationWorkItem = work

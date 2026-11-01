@@ -535,11 +535,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let anyBLE = x6BLEConnected || chromecastBLEConnected
         let doubaoSnapshot = doubaoAudioState.snapshotNow()
         let doubaoUsesVRemote = doubaoSnapshot.inputDeviceNames.contains("vRemoteDr 2ch")
+        let hostLabel = doubaoAudioState.activeHostTitle
+            ?? AppStorage.voiceInputHost.shortTitle
+        // 微信输入法没有独立的麦克风设置时，录音来源就是系统默认输入；
+        // 没有切到虚拟设备就一句提示，免得用户以为遥控器坏了。
+        let currentHost = InputSourceProbe.currentInputMethodBundleID()
+            .flatMap(VoiceInputHost.host(forBundleID:))
+            ?? doubaoSnapshot.hostBundleID
+                .flatMap(VoiceInputHost.host(forBundleID:))
+        let needsDefaultInput = currentHost == .weType
         let statusText: String
         if doubaoSnapshot.isRecording && !doubaoUsesVRemote {
-            statusText = L10n.text("豆包输入设备错误", "Incorrect Doubao input")
+            statusText = L10n.text(
+                "\(hostLabel)输入设备错误",
+                "\(hostLabel): wrong input"
+            )
         } else if remoteStreaming {
             statusText = L10n.text("遥控器录音中", "Remote recording")
+        } else if needsDefaultInput, !audioRoute.isTargetDefaultInput {
+            statusText = L10n.text(
+                "输入设备未指向 vRemoteDr 2ch",
+                "Input is not vRemoteDr 2ch"
+            )
         } else if anyHID && anyBLE {
             statusText = L10n.text("已就绪", "Ready")
         } else if anyHID || anyBLE {
@@ -598,6 +615,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         debugWindow.onInputTriggerChanged = { [weak self] in
             self?.x6SearchSuppressor.triggerConfigurationDidChange()
+        }
+        debugWindow.onVoiceInputHostChanged = { [weak self] in
+            // 被监控的 bundle id 换了，立刻重新绑定并刷新状态行。
+            _ = self?.doubaoAudioState.snapshotNow()
+            self?.updateStatus()
         }
         debugWindow.onRemoteMappingEnabledChanged = { [weak self] remote, enabled in
             switch remote {

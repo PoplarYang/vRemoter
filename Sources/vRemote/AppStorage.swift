@@ -6,6 +6,8 @@ enum AppStorage {
     static let macInputEnabledKey = "macInputEnabled"
     static let remoteInputEnabledKey = "remoteInputEnabled"
     static let inputTriggerKeyKey = "inputTriggerKey"
+    static let voiceInputHostKey = "voiceInputHost"
+    static let voiceTriggerStyleKey = "voiceTriggerStyle"
 
     static let logsDirectory: URL = {
         FileManager.default.homeDirectoryForCurrentUser
@@ -34,6 +36,8 @@ enum AppStorage {
             macInputEnabledKey: true,
             remoteInputEnabledKey: true,
             inputTriggerKeyKey: InputTriggerKey.option.rawValue,
+            voiceInputHostKey: VoiceInputHost.automatic.rawValue,
+            voiceTriggerStyleKey: VoiceTriggerStyle.tapToggle.rawValue,
         ])
         ensureDirectory(logsDirectory)
         ensureDirectory(applicationSupportDirectory)
@@ -69,6 +73,32 @@ enum AppStorage {
         }
         set {
             UserDefaults.standard.set(newValue.rawValue, forKey: inputTriggerKeyKey)
+        }
+    }
+
+    /// 遥控器要驱动的输入法。`automatic` 表示同时观察豆包与微信输入法。
+    static var voiceInputHost: VoiceInputHost {
+        get {
+            let raw = UserDefaults.standard.string(forKey: voiceInputHostKey)
+            return VoiceInputHost(rawValue: raw ?? "") ?? .automatic
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: voiceInputHostKey)
+        }
+    }
+
+    /// 触发方式。默认 `tapToggle` 保持豆包的老行为；微信输入法由
+    /// `VoiceTriggerStyle.resolve` 在自动检测下自动改用长按语义。
+    static var voiceTriggerStyle: VoiceTriggerStyle {
+        get {
+            let raw = UserDefaults.standard.string(forKey: voiceTriggerStyleKey)
+            return VoiceTriggerStyle(rawValue: raw ?? "") ?? .tapToggle
+        }
+        set {
+            UserDefaults.standard.set(
+                newValue.rawValue,
+                forKey: voiceTriggerStyleKey
+            )
         }
     }
 
