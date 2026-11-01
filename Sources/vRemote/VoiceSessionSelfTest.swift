@@ -170,6 +170,16 @@ enum VoiceSessionSelfTest {
         testUnreadableStateKeepsSession(checks)
         testMissingProcessObjectCloses(checks)
         testUnbindableProcessKeepsSession(checks)
+        testAudioRouteSwitchesInput(checks)
+        testAudioRouteRestoresOnStop(checks)
+        testAudioRouteSettlesLeftoverAfterCrash(checks)
+        testAudioRouteRespectsUserChange(checks)
+        testAudioRouteSkipsWhenTargetMissing(checks)
+        testAudioRouteLeavesManualChoiceAlone(checks)
+        testAudioRouteHonoursDisabledSwitch(checks)
+        testAudioRouteProtectsOutput(checks)
+        testAudioRouteFallsBackWhenSavedDeviceGone(checks)
+        testAudioRouteManualRestoreWithoutHistory(checks)
         emit("[SELF-TEST] completed failures=\(checks.failures)")
         return checks.failures == 0
     }
@@ -425,6 +435,297 @@ enum VoiceSessionSelfTest {
         c.expect(
             h.coordinator.debugSnapshot.phase == "open",
             "running but unbindable Doubao keeps the session"
+        )
+    }
+
+    // MARK: - 系统默认输入接管
+
+    private static let builtInMic = AudioDeviceSnapshot(
+        id: 1,
+        uid: "AppleHDAEngineInput:1F,3,0,1,0:1",
+        name: "Built-in Microphone",
+        inputChannels: 2,
+        outputChannels: 0
+    )
+
+    private static let builtInSpeaker = AudioDeviceSnapshot(
+        id: 2,
+        uid: "AppleHDAEngineOutput:1F,3,0,1,1:0",
+        name: "Built-in Output",
+        inputChannels: 0,
+        outputChannels: 2
+    )
+
+    private static let virtualDriver = AudioDeviceSnapshot(
+        id: 3,
+        uid: "vRemoteDr2ch_UID",
+        name: "vRemoteDr 2ch",
+        inputChannels: 2,
+        outputChannels: 2
+    )
+
+    private static let usbMic = AudioDeviceSnapshot(
+        id: 4,
+        uid: "USBAudioEngine:USB Mic:1",
+        name: "USB Mic",
+        inputChannels: 1,
+        outputChannels: 0
+    )
+
+    private final class FakeAudioDevices: AudioDeviceProviding {
+        private var devices: [AudioDeviceSnapshot]
+        private var inputUID: String
+        private var outputUID: String
+        private(set) var setInputCalls: [String] = []
+        private(set) var setOutputCalls: [String] = []
+
+        init(
+            devices: [AudioDeviceSnapshot],
+            inputUID: String,
+            outputUID: String
+        ) {
+            self.devices = devices
+            self.inputUID = inputUID
+            self.outputUID = outputUID
+        }
+
+        func allDevices() -> [AudioDeviceSnapshot] { devices }
+
+        func defaultInput() -> AudioDeviceSnapshot? {
+            devices.first { $0.uid == inputUID }
+        }
+
+        func defaultOutput() -> AudioDeviceSnapshot? {
+            devices.first { $0.uid == outputUID }
+        }
+
+        @discardableResult
+        func setDefaultInput(_ device: AudioDeviceSnapshot) -> Bool {
+            setInputCalls.append(device.uid)
+            inputUID = device.uid
+            return true
+        }
+
+        @discardableResult
+        func setDefaultOutput(_ device: AudioDeviceSnapshot) -> Bool {
+            setOutputCalls.append(device.uid)
+            outputUID = device.uid
+            return true
+        }
+
+        /// 模拟用户手动切换默认输入。
+        func selectInput(uid: String) { inputUID = uid }
+        /// 模拟设备被拔掉。
+        func removeDevice(uid: String) { devices.removeAll { $0.uid == uid } }
+    }
+
+    private final class FakeRouteStore: AudioRouteStoring {
+        var autoRouteInput: Bool
+        var savedInputUID: String?
+        var pendingRestore: Bool
+
+        init(
+            autoRouteInput: Bool = true,
+            savedInputUID: String? = nil,
+            pendingRestore: Bool = false
+        ) {
+            self.autoRouteInput = autoRouteInput
+            self.savedInputUID = savedInputUID
+            self.pendingRestore = pendingRestore
+        }
+    }
+
+    private static func makeRouteDevices(
+        input: AudioDeviceSnapshot = builtInMic,
+        output: AudioDeviceSnapshot = builtInSpeaker,
+        includeVirtual: Bool = true,
+        includeUSB: Bool = true
+    ) -> FakeAudioDevices {
+        var list = [builtInMic, builtInSpeaker]
+        if includeVirtual { list.append(virtualDriver) }
+        if includeUSB { list.append(usbMic) }
+        return FakeAudioDevices(
+            devices: list,
+            inputUID: input.uid,
+            outputUID: output.uid
+        )
+    }
+
+    private static func testAudioRouteSwitchesInput(_ c: CheckContext) {
+        let devices = makeRouteDevices()
+        let store = FakeRouteStore()
+        let route = AudioDeviceRoute(devices: devices, store: store)
+        route.start()
+
+        c.expect(
+            devices.defaultInput()?.uid == virtualDriver.uid,
+            "route moves default input to vRemoteDr"
+        )
+        c.expect(
+            store.savedInputUID == builtInMic.uid,
+            "route remembers the replaced input uid"
+        )
+        c.expect(
+            store.pendingRestore,
+            "route leaves a restore mark for crashes"
+        )
+        c.expect(
+            devices.setOutputCalls.isEmpty,
+            "route never touches the default output"
+        )
+    }
+
+    private static func testAudioRouteRestoresOnStop(_ c: CheckContext) {
+        let devices = makeRouteDevices()
+        let store = FakeRouteStore()
+        let route = AudioDeviceRoute(devices: devices, store: store)
+        route.start()
+        route.stop()
+
+        c.expect(
+            devices.defaultInput()?.uid == builtInMic.uid,
+            "quit restores the original default input"
+        )
+        c.expect(
+            !store.pendingRestore && store.savedInputUID == nil,
+            "quit clears the restore mark"
+        )
+    }
+
+    /// 强杀之后留下的标记：下次启动先把设备还回去，再按需重新接管。
+    private static func testAudioRouteSettlesLeftoverAfterCrash(_ c: CheckContext) {
+        let devices = makeRouteDevices(input: virtualDriver)
+        let store = FakeRouteStore(
+            savedInputUID: builtInMic.uid,
+            pendingRestore: true
+        )
+        let route = AudioDeviceRoute(devices: devices, store: store)
+        route.start()
+
+        c.expect(
+            devices.setInputCalls.first == builtInMic.uid,
+            "leftover route is settled before re-taking the input"
+        )
+        c.expect(
+            devices.defaultInput()?.uid == virtualDriver.uid,
+            "running app re-takes the input after settling"
+        )
+        c.expect(
+            store.savedInputUID == builtInMic.uid,
+            "re-take records the settled device again"
+        )
+    }
+
+    private static func testAudioRouteRespectsUserChange(_ c: CheckContext) {
+        let devices = makeRouteDevices()
+        let store = FakeRouteStore()
+        let route = AudioDeviceRoute(devices: devices, store: store)
+        route.start()
+        devices.selectInput(uid: usbMic.uid)
+        route.stop()
+
+        c.expect(
+            devices.defaultInput()?.uid == usbMic.uid,
+            "user's own device choice survives quit"
+        )
+        c.expect(
+            !store.pendingRestore,
+            "quit clears the mark even when the user took over"
+        )
+    }
+
+    private static func testAudioRouteSkipsWhenTargetMissing(_ c: CheckContext) {
+        let devices = makeRouteDevices(includeVirtual: false)
+        let store = FakeRouteStore()
+        let route = AudioDeviceRoute(devices: devices, store: store)
+        route.start()
+
+        c.expect(
+            devices.defaultInput()?.uid == builtInMic.uid,
+            "missing driver leaves the input alone"
+        )
+        c.expect(
+            !store.pendingRestore,
+            "missing driver writes no restore mark"
+        )
+    }
+
+    /// 默认输入已经是虚拟设备（上一版手动设的）：不做多余的设备写入，
+    /// 但要接管还原责任，否则退出后系统会停在没人写入的设备上。
+    private static func testAudioRouteLeavesManualChoiceAlone(_ c: CheckContext) {
+        let devices = makeRouteDevices(input: virtualDriver)
+        let store = FakeRouteStore()
+        let route = AudioDeviceRoute(devices: devices, store: store)
+        route.start()
+
+        c.expect(
+            devices.setInputCalls.isEmpty,
+            "an already-correct input needs no device write"
+        )
+        c.expect(
+            store.savedInputUID == builtInMic.uid && store.pendingRestore,
+            "an existing virtual input is adopted for restore"
+        )
+
+        route.stop()
+        c.expect(
+            devices.defaultInput()?.uid == builtInMic.uid,
+            "the adopted virtual input is reverted on quit"
+        )
+    }
+
+    private static func testAudioRouteHonoursDisabledSwitch(_ c: CheckContext) {
+        let devices = makeRouteDevices()
+        let store = FakeRouteStore(autoRouteInput: false)
+        let route = AudioDeviceRoute(devices: devices, store: store)
+        route.start()
+
+        c.expect(
+            devices.defaultInput()?.uid == builtInMic.uid,
+            "disabled auto-route leaves the system input untouched"
+        )
+    }
+
+    /// vRemoteDr 2ch 出现在输出列表时，误选会让整机静音，必须救回来。
+    private static func testAudioRouteProtectsOutput(_ c: CheckContext) {
+        let devices = makeRouteDevices(output: virtualDriver)
+        let store = FakeRouteStore(autoRouteInput: false)
+        let route = AudioDeviceRoute(devices: devices, store: store)
+        route.start()
+
+        c.expect(
+            devices.defaultOutput()?.uid == builtInSpeaker.uid,
+            "virtual default output is moved back to the speaker"
+        )
+    }
+
+    private static func testAudioRouteFallsBackWhenSavedDeviceGone(_ c: CheckContext) {
+        let devices = makeRouteDevices(input: virtualDriver, includeUSB: false)
+        let store = FakeRouteStore(
+            savedInputUID: usbMic.uid,
+            pendingRestore: true
+        )
+        let route = AudioDeviceRoute(devices: devices, store: store)
+        route.start()
+
+        c.expect(
+            devices.setInputCalls.contains(builtInMic.uid),
+            "unplugged original device falls back to the built-in mic"
+        )
+    }
+
+    private static func testAudioRouteManualRestoreWithoutHistory(_ c: CheckContext) {
+        // 自动切换关掉时不收养，模拟「用户手工选过虚拟设备、App 没有记录」。
+        let devices = makeRouteDevices(input: virtualDriver)
+        let store = FakeRouteStore(autoRouteInput: false)
+        let route = AudioDeviceRoute(devices: devices, store: store)
+        route.start()
+
+        let restored = route.restoreNow()
+        c.expect(restored, "manual restore works without a saved uid")
+        c.expect(
+            devices.defaultInput()?.uid == builtInMic.uid,
+            "manual restore picks the built-in mic when history is missing"
         )
     }
 }

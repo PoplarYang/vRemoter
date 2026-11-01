@@ -30,6 +30,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var logSizeItem: NSMenuItem!
     private var recordingToggleItem: NSMenuItem!
     private var recordingSizeItem: NSMenuItem!
+    private var autoRouteItem: NSMenuItem!
     private var languageItems: [AppLanguage: NSMenuItem] = [:]
 
     private var x6HIDConnected = false
@@ -46,6 +47,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let chromecastHID = ChromecastRemoteHIDBridge()
     private let x6SearchSuppressor = X6SearchSuppressor()
     private let doubaoAudioState = DoubaoAudioStateMonitor()
+    /// 系统默认输入设备的接管与还原。退出时务必 stop()，否则其他 App
+    /// 会继续从没人写入的 vRemoteDr 2ch 录音，表现为「麦克风没声音」。
+    private let audioRoute = AudioDeviceRoute()
     private lazy var x6Session = X6SessionCoordinator(
         doubaoState: doubaoAudioState
     )
@@ -309,6 +313,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.updateStatus()
         }
 
+        // 接管系统默认输入。必须在 AudioPipe 之后：先让混音管线绑定好
+        // 输出设备，再改系统默认输入，避免采集侧拿到虚拟设备造成自激。
+        audioRoute.onRouteChanged = { [weak self] in
+            self?.updateStatus()
+        }
+        audioRoute.start()
+        if audioRoute.targetDevice() == nil {
+            // 驱动被系统加载的时机可能晚于 App 启动，补一次。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                self?.audioRoute.retryIfNeeded()
+            }
+        }
+
         DispatchQueue.main.async { [weak self] in
             self?.debugWindow.show()
         }
@@ -414,6 +431,31 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         restart.target = self
         submenu.addItem(restart)
+
+        submenu.addItem(.separator())
+        let autoRoute = NSMenuItem(
+            title: L10n.text(
+                "自动切换系统默认输入",
+                "Auto-switch default input"
+            ),
+            action: #selector(toggleAutoRouteInput),
+            keyEquivalent: ""
+        )
+        autoRoute.target = self
+        autoRoute.state = audioRoute.autoRouteEnabled ? .on : .off
+        submenu.addItem(autoRoute)
+        autoRouteItem = autoRoute
+
+        let restoreAudio = NSMenuItem(
+            title: L10n.text(
+                "恢复系统音频设备",
+                "Restore system audio devices"
+            ),
+            action: #selector(restoreAudioDevices),
+            keyEquivalent: ""
+        )
+        restoreAudio.target = self
+        submenu.addItem(restoreAudio)
 
         root.submenu = submenu
         return root
@@ -601,6 +643,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stopMicrophoneNow()
     }
 
+    /// 出问题时的兜底入口：把默认输入从虚拟设备还回真实麦克风。
+    /// 关闭 App 后才发现没声音的情况，重开再点这里也能修。
+    @objc private func restoreAudioDevices() {
+        let restored = audioRoute.restoreNow()
+        if !restored, let description = audioRoute.lastActionDescription {
+            headerLabel.title = "状态 · \(description)"
+        }
+        updateStatus()
+    }
+
+    @objc private func toggleAutoRouteInput() {
+        let enabled = !audioRoute.autoRouteEnabled
+        audioRoute.setAutoRoute(enabled)
+        autoRouteItem?.state = enabled ? .on : .off
+        print("[ROUTE] 自动切换默认输入 = \(enabled ? "开" : "关")")
+        updateStatus()
+    }
+
     private func stopMicrophoneNow() {
         x6Session.forceClose()
         x6BLE.closeMicrophone(force: true)
@@ -682,6 +742,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         launchAtLoginItem?.state = LaunchAtLogin.isEnabled ? .on : .off
         loggingToggleItem?.state = Log.isEnabled ? .on : .off
         recordingToggleItem?.state = AppStorage.recordingEnabled ? .on : .off
+        autoRouteItem?.state = audioRoute.autoRouteEnabled ? .on : .off
         refreshSizeLabels()
     }
 
@@ -759,6 +820,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         x6BLE.stop()
         chromecastBLE.stop()
         AudioPipe.shared.stop()
+        // 混音管线停了之后再还设备，否则中间会有一小段「默认输入是虚拟
+        // 设备但没人写入」的空窗，其他 App 录音会拿到静音。
+        audioRoute.stop()
     }
 }
 
