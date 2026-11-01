@@ -53,6 +53,9 @@ final class BLEBridge: NSObject {
     private var atvvCharsComplete = false
     private var connectedPeripheralID: UUID?
     private var connectTimeout: DispatchWorkItem?
+    /// 扫描期间轮询「系统已连接」的设备。被 macOS 以 HID 身份重连的遥控器
+    /// 不再广播，纯扫描永远看不到它，只有 retrieveConnectedPeripherals 能找到。
+    private var connectedPeripheralPoll: Timer?
 
     private let protocolHandler = ATVVProtocol()
     private var streamID: UInt8 = 0
@@ -107,6 +110,7 @@ final class BLEBridge: NSObject {
 
     func stop() {
         isStarted = false
+        stopConnectedPeripheralPoll()
         closeTimeoutWorkItem?.cancel()
         closeTimeoutWorkItem = nil
         stopKeepAliveTimer()
@@ -263,6 +267,41 @@ final class BLEBridge: NSObject {
             withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
+        startConnectedPeripheralPoll()
+    }
+
+    // MARK: - 扫描期间兜底查找
+
+    /// 遥控器断开后，macOS 常常会以系统 HID 设备身份自己把它连回来，
+    /// 此时 BLE 侧不再广播，扫描永远扫不到，界面就卡在「正在连接语音服务」。
+    /// 扫描期间每 3 秒问一次系统「你已经连了哪些」，有就直接接管。
+    private func startConnectedPeripheralPoll() {
+        stopConnectedPeripheralPoll()
+        connectedPeripheralPoll = Timer.scheduledTimer(
+            withTimeInterval: 3.0,
+            repeats: true
+        ) { [weak self] _ in
+            guard let self, self.isStarted,
+                  self.central.state == .poweredOn,
+                  self.connectedPeripheralID == nil
+            else { return }
+            let connected = self.central.retrieveConnectedPeripherals(
+                withServices: [Self.serviceUUID]
+            )
+            guard let candidate = connected.first(where: self.matches) else {
+                return
+            }
+            print(
+                "[\(self.logTag)] 扫描期间发现系统已连接设备，直接 connect: " +
+                "\(candidate.identifier)"
+            )
+            self.connect(to: candidate)
+        }
+    }
+
+    private func stopConnectedPeripheralPoll() {
+        connectedPeripheralPoll?.invalidate()
+        connectedPeripheralPoll = nil
     }
 
     fileprivate func saveUUID(_ id: UUID) {
@@ -282,6 +321,7 @@ final class BLEBridge: NSObject {
     ) {
         guard matches(p) else { return }
         connectTimeout?.cancel()
+        stopConnectedPeripheralPoll()
         peripheral = p
         connectedPeripheralID = nil
         p.delegate = self
@@ -460,6 +500,8 @@ extension BLEBridge: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
+        // 连接超时后被主动取消也会走到这里，那种情况超时处理器已经转去扫描了。
+        let wasConnected = connectedPeripheralID == peripheral.identifier
         connectTimeout?.cancel()
         connectTimeout = nil
         closeTimeoutWorkItem?.cancel()
@@ -468,8 +510,12 @@ extension BLEBridge: CBCentralManagerDelegate {
         print("[\(logTag)] 断开: \(error?.localizedDescription ?? "ok")")
         onConnectionChanged?(false)
         finishAudioStreamLocally(reason: 0xFC)
+        // 按启动时的方式重连：遥控器通常会被 macOS 以 HID 身份重新连上，
+        // 那时它不再广播，只能靠 retrieveConnectedPeripherals 接管。
+        guard wasConnected else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-            self?.beginScan()
+            guard let self, self.isStarted else { return }
+            self.tryDirectConnect()
         }
     }
 }
