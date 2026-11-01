@@ -18,12 +18,22 @@ protocol DoubaoAudioStateProviding: AnyObject {
         get set
     }
 
+    /// See `usesDeviceListFallback` in the extension below.
+    var usesDeviceListFallback: Bool { get }
+
     func start()
     func stop()
     func snapshotNow() -> DoubaoAudioStateMonitor.Snapshot
 }
 
 extension DoubaoAudioStateMonitor: DoubaoAudioStateProviding {}
+
+extension DoubaoAudioStateProviding {
+    /// True only when capture state is inferred from the input-device list,
+    /// which is the macOS 13 fallback. Everywhere else the state comes from
+    /// `kAudioProcessPropertyIsRunningInput` and behaves as before.
+    var usesDeviceListFallback: Bool { false }
+}
 
 /// Coordinates the input-method toggle, supported remote gestures, and each
 /// remote's independent ATVV transport.
@@ -63,6 +73,8 @@ final class X6SessionCoordinator {
     private static let openConfirmationTimeout: TimeInterval = 1.0
     private static let closeVerificationTimeout: TimeInterval = 1.2
     private static let maximumOpenAttempts = 3
+    private static let startVerificationAttempts = 3
+    private static let startVerificationInterval: TimeInterval = 1.0
 
     private let doubaoState: any DoubaoAudioStateProviding
     private let setRemoteRouteActive: (Bool) -> Void
@@ -83,6 +95,7 @@ final class X6SessionCoordinator {
     private var closeVerificationWorkItem: DispatchWorkItem?
     private var openRetryWorkItem: DispatchWorkItem?
     private var openConfirmationWorkItem: DispatchWorkItem?
+    private var idleConfirmationWorkItem: DispatchWorkItem?
 
     var preferredRemoteProvider: (() -> VoiceRemoteID?)?
     var onMicrophoneOpenRequested:
@@ -467,7 +480,15 @@ final class X6SessionCoordinator {
             case .opening:
                 // The opening verification owns this transient idle window.
                 break
-            case .open, .closing:
+            case .open:
+                if self.doubaoState.usesDeviceListFallback {
+                    // The device list can drop a frame while the input method
+                    // swaps buffers, so confirm before tearing down.
+                    self.confirmIdleThenClose()
+                } else {
+                    self.finalizeClosed(reason: "Doubao inactive")
+                }
+            case .closing:
                 finalizeClosed(reason: "Doubao inactive")
             case .closed:
                 if routeActive || !streamingRemotes.isEmpty {
@@ -732,7 +753,10 @@ final class X6SessionCoordinator {
 
     // MARK: - Verification and route lifecycle
 
-    private func scheduleStartVerification(for expectedGeneration: UInt64) {
+    private func scheduleStartVerification(
+        for expectedGeneration: UInt64,
+        attempt: Int = 1
+    ) {
         startVerificationWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self,
@@ -745,11 +769,45 @@ final class X6SessionCoordinator {
                 self.handleDoubaoSnapshot(snapshot)
                 return
             }
-            self.finalizeClosed(reason: "opening timeout")
-            self.publish("豆包未启动 · 遥控器自动关闭")
+            // Doubao needs close to a second to actually open the capture
+            // device, so a single 1 s probe aborts dictations that are about
+            // to start. Retrying only ever delays the auto-close of a session
+            // that never opens: a real activation cancels this work item via
+            // `handleDoubaoSnapshot(.active)`.
+            if attempt < Self.startVerificationAttempts {
+                print(
+                    "[VOICE-SESSION] 开麦验证 attempt=\(attempt) " +
+                    "state=\(snapshot.state.rawValue) · 重试"
+                )
+                self.scheduleStartVerification(
+                    for: expectedGeneration,
+                    attempt: attempt + 1
+                )
+                return
+            }
+            // `pid` is set whenever Doubao is running, `processObjectID` only
+            // when this system can bind it. Either one means "Doubao is here
+            // but its capture state is unreadable", which must never close a
+            // session. No pid at all means Doubao is gone: close as before.
+            let doubaoIsRunning = snapshot.processObjectID != nil
+                || snapshot.pid != nil
+            guard snapshot.state == .unavailable, doubaoIsRunning else {
+                self.finalizeClosed(reason: "opening timeout")
+                self.publish("豆包未启动 · 遥控器自动关闭")
+                return
+            }
+            // The process object exists but this platform cannot report its
+            // capture state. Never close a session on an unknown answer.
+            self.phase = .open
+            self.activateRemoteRoute()
+            print("[VOICE-SESSION] 豆包状态不可读 · 保持会话")
+            self.publish("豆包录音中 · 无法读取状态")
         }
         startVerificationWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.startVerificationInterval,
+            execute: work
+        )
     }
 
     private func scheduleCloseVerification(for expectedGeneration: UInt64) {
@@ -789,6 +847,28 @@ final class X6SessionCoordinator {
             deadline: .now() + Self.closeVerificationTimeout,
             execute: work
         )
+    }
+
+    /// Capture state can flicker to idle for a single poll while Doubao swaps
+    /// buffers. Re-read once before tearing the session down.
+    private func confirmIdleThenClose() {
+        idleConfirmationWorkItem?.cancel()
+        let expectedGeneration = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.generation == expectedGeneration,
+                  self.phase == .open
+            else { return }
+            self.idleConfirmationWorkItem = nil
+            let snapshot = self.doubaoState.snapshotNow()
+            guard !snapshot.isRecording else {
+                print("[VOICE-SESSION] idle 抖动已恢复 · 保持会话")
+                return
+            }
+            self.finalizeClosed(reason: "Doubao inactive")
+        }
+        idleConfirmationWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
     private func reconcileSoon(after delay: TimeInterval) {
@@ -855,6 +935,8 @@ final class X6SessionCoordinator {
         openRetryWorkItem = nil
         openConfirmationWorkItem?.cancel()
         openConfirmationWorkItem = nil
+        idleConfirmationWorkItem?.cancel()
+        idleConfirmationWorkItem = nil
     }
 
     private func publish(_ status: String) {

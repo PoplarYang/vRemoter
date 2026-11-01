@@ -8,6 +8,13 @@ import Foundation
 /// `kAudioProcessPropertyIsRunningInput` is the source of truth for whether
 /// Doubao is currently recording, and `kAudioProcessPropertyDevices` tells us
 /// which input device it actually opened.
+///
+/// macOS 13 knows the audio process object and its PID but rejects
+/// `kAudioProcessPropertyIsRunningInput` with `'who?'` (the selector only
+/// exists from 14.2). There the input device list is the fallback: it is
+/// populated exactly while the process captures from an input device. Without
+/// this fallback the state stays `unavailable`, and the session coordinator
+/// closes every dictation after its one-second opening verification.
 final class DoubaoAudioStateMonitor {
     enum State: String {
         case unavailable
@@ -38,8 +45,20 @@ final class DoubaoAudioStateMonitor {
     private var processObjectID = AudioObjectID(kAudioObjectUnknown)
     private var processPID: pid_t?
     private var lastSnapshot: Snapshot?
+    private var pollTimer: Timer?
+
+    /// macOS 14.2+ answers `kAudioProcessPropertyIsRunningInput`; older systems
+    /// reject it with `'who?'`. Probed once per bind so the log states which
+    /// source the snapshot came from. `nil` until the first successful read.
+    private var usesInputRunningProperty: Bool?
+
+    private static let pollInterval: TimeInterval = 0.4
 
     var onSnapshotChanged: ((Snapshot) -> Void)?
+
+    /// True only while the input-device list is the state source, i.e. before
+    /// `kAudioProcessPropertyIsRunningInput` has ever answered.
+    var usesDeviceListFallback: Bool { usesInputRunningProperty == false }
 
     private lazy var processListListener: AudioObjectPropertyListenerBlock = {
         [weak self] _, _ in
@@ -70,11 +89,27 @@ final class DoubaoAudioStateMonitor {
             print("[DOUBAO-STATE] 无法监听音频进程列表: \(Self.describe(status))")
         }
         refreshBindingAndPublish(force: true)
+        startPolling()
+    }
+
+    /// The input-device listener is unreliable on 13.x, so a low-rate poll
+    /// backs it up. `publishCurrentSnapshot` deduplicates, so polling only
+    /// produces output when the state really changes.
+    private func startPolling() {
+        pollTimer?.invalidate()
+        let timer = Timer(timeInterval: Self.pollInterval, repeats: true) {
+            [weak self] _ in
+            self?.refreshBindingAndPublish(force: false)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        pollTimer = timer
     }
 
     func stop() {
         guard started else { return }
         started = false
+        pollTimer?.invalidate()
+        pollTimer = nil
         unbindProcessObject()
 
         var address = Self.processListAddress
@@ -193,6 +228,17 @@ final class DoubaoAudioStateMonitor {
             )
         }
         onSnapshotChanged?(snapshot)
+        stopPollingIfNative()
+    }
+
+    /// On 14.2+ the property listeners are enough, so the poll is retired as
+    /// soon as the native selector answers. Only the device-list fallback
+    /// needs it.
+    private func stopPollingIfNative() {
+        guard usesInputRunningProperty == true, pollTimer != nil else { return }
+        pollTimer?.invalidate()
+        pollTimer = nil
+        print("[DOUBAO-STATE] 原生状态可用 · 停止轮询")
     }
 
     private func readCurrentSnapshot() -> Snapshot {
@@ -206,32 +252,61 @@ final class DoubaoAudioStateMonitor {
             )
         }
 
-        guard let running = Self.uint32Property(
+        // Preferred path: macOS 14.2+ reports capture state directly.
+        if let running = Self.uint32Property(
             object: processObjectID,
             selector: kAudioProcessPropertyIsRunningInput,
             scope: kAudioObjectPropertyScopeGlobal
-        ) else {
+        ) {
+            if usesInputRunningProperty != true {
+                usesInputRunningProperty = true
+                print("[DOUBAO-STATE] 使用 IsRunningInput 探测录音状态")
+            }
+            let deviceIDs = Self.objectListProperty(
+                object: processObjectID,
+                selector: kAudioProcessPropertyDevices,
+                scope: kAudioObjectPropertyScopeInput
+            ) ?? []
+            let names = deviceIDs.map(Self.deviceName)
             return Snapshot(
-                state: .unavailable,
+                state: running == 0 ? .inactive : .active,
                 pid: processPID,
                 processObjectID: processObjectID,
-                inputDeviceIDs: [],
-                inputDeviceNames: []
+                inputDeviceIDs: deviceIDs,
+                inputDeviceNames: names
             )
         }
 
-        let deviceIDs = Self.objectListProperty(
+        // Fallback for 13.x: the selector is rejected, but the process object
+        // still lists the input devices it currently holds open. The list is
+        // empty while idle and contains the capture device while recording.
+        if let deviceIDs = Self.objectListProperty(
             object: processObjectID,
             selector: kAudioProcessPropertyDevices,
             scope: kAudioObjectPropertyScopeInput
-        )
-        let names = deviceIDs.map(Self.deviceName)
+        ) {
+            if usesInputRunningProperty != false {
+                usesInputRunningProperty = false
+                print(
+                    "[DOUBAO-STATE] IsRunningInput 不可用，改用输入设备列表探测"
+                )
+            }
+            let names = deviceIDs.map(Self.deviceName)
+            return Snapshot(
+                state: deviceIDs.isEmpty ? .inactive : .active,
+                pid: processPID,
+                processObjectID: processObjectID,
+                inputDeviceIDs: deviceIDs,
+                inputDeviceNames: names
+            )
+        }
+
         return Snapshot(
-            state: running == 0 ? .inactive : .active,
+            state: .unavailable,
             pid: processPID,
             processObjectID: processObjectID,
-            inputDeviceIDs: deviceIDs,
-            inputDeviceNames: names
+            inputDeviceIDs: [],
+            inputDeviceNames: []
         )
     }
 
@@ -284,7 +359,7 @@ final class DoubaoAudioStateMonitor {
         object: AudioObjectID,
         selector: AudioObjectPropertySelector,
         scope: AudioObjectPropertyScope
-    ) -> [AudioObjectID] {
+    ) -> [AudioObjectID]? {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
             mScope: scope,
@@ -297,7 +372,8 @@ final class DoubaoAudioStateMonitor {
             0,
             nil,
             &size
-        ) == noErr, size > 0 else { return [] }
+        ) == noErr else { return nil }
+        if size == 0 { return [] }
 
         var values = [AudioObjectID](
             repeating: 0,
@@ -310,7 +386,7 @@ final class DoubaoAudioStateMonitor {
             nil,
             &size,
             &values
-        ) == noErr else { return [] }
+        ) == noErr else { return nil }
         return values
     }
 

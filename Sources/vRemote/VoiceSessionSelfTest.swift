@@ -6,9 +6,24 @@ enum VoiceSessionSelfTest {
     private final class FakeDoubaoState: DoubaoAudioStateProviding {
         var onSnapshotChanged: ((DoubaoAudioStateMonitor.Snapshot) -> Void)?
         private(set) var snapshot: DoubaoAudioStateMonitor.Snapshot
+        let usesDeviceListFallback: Bool
+        private let boundProcessObjectID: AudioObjectID?
+        private let boundPID: pid_t?
 
-        init(state: DoubaoAudioStateMonitor.State = .inactive) {
-            snapshot = Self.makeSnapshot(state)
+        init(
+            state: DoubaoAudioStateMonitor.State = .inactive,
+            usesDeviceListFallback: Bool = false,
+            processObjectID: AudioObjectID? = 456,
+            pid: pid_t? = 123
+        ) {
+            self.usesDeviceListFallback = usesDeviceListFallback
+            boundProcessObjectID = processObjectID
+            boundPID = pid
+            snapshot = Self.makeSnapshot(
+                state,
+                processObjectID: processObjectID,
+                pid: pid
+            )
         }
 
         func start() {}
@@ -19,17 +34,23 @@ enum VoiceSessionSelfTest {
         }
 
         func emit(_ state: DoubaoAudioStateMonitor.State) {
-            snapshot = Self.makeSnapshot(state)
+            snapshot = Self.makeSnapshot(
+                state,
+                processObjectID: boundProcessObjectID,
+                pid: boundPID
+            )
             onSnapshotChanged?(snapshot)
         }
 
         private static func makeSnapshot(
-            _ state: DoubaoAudioStateMonitor.State
+            _ state: DoubaoAudioStateMonitor.State,
+            processObjectID: AudioObjectID?,
+            pid: pid_t?
         ) -> DoubaoAudioStateMonitor.Snapshot {
             DoubaoAudioStateMonitor.Snapshot(
                 state: state,
-                pid: 123,
-                processObjectID: 456,
+                pid: pid,
+                processObjectID: processObjectID,
                 inputDeviceIDs: state == .active ? [789] : [],
                 inputDeviceNames: state == .active ? ["vRemoteDr 2ch"] : []
             )
@@ -47,8 +68,18 @@ enum VoiceSessionSelfTest {
         var openResults = [RemoteMicrophoneOpenResult]()
         var preferredRemote: VoiceRemoteID? = .chromecast
 
-        init(initialState: DoubaoAudioStateMonitor.State = .inactive) {
-            doubao = FakeDoubaoState(state: initialState)
+        init(
+            initialState: DoubaoAudioStateMonitor.State = .inactive,
+            usesDeviceListFallback: Bool = false,
+            processObjectID: AudioObjectID? = 456,
+            pid: pid_t? = 123
+        ) {
+            doubao = FakeDoubaoState(
+                state: initialState,
+                usesDeviceListFallback: usesDeviceListFallback,
+                processObjectID: processObjectID,
+                pid: pid
+            )
             var routeSink: ((Bool) -> Void)?
             var triggerSink: (() -> Void)?
             var nowSink: (() -> Date)?
@@ -133,6 +164,12 @@ enum VoiceSessionSelfTest {
         testChromecastReasonZeroWhileClosedIsIgnored(checks)
         testIndependentRemoteStops(checks)
         testDebouncedRetry(checks)
+        testNativeIdleClosesImmediately(checks)
+        testFallbackIdleIsDebounced(checks)
+        testNeverStartingSessionCloses(checks)
+        testUnreadableStateKeepsSession(checks)
+        testMissingProcessObjectCloses(checks)
+        testUnbindableProcessKeepsSession(checks)
         emit("[SELF-TEST] completed failures=\(checks.failures)")
         return checks.failures == 0
     }
@@ -277,6 +314,117 @@ enum VoiceSessionSelfTest {
         c.expect(
             h.coordinator.debugSnapshot.openRequestedRemote == .chromecast,
             "only the sent retry becomes pending"
+        )
+    }
+
+    // MARK: - Capture-state source compatibility
+
+    /// macOS 14.2+ path: `IsRunningInput` is authoritative, so an idle snapshot
+    /// must close the session without any extra confirmation window.
+    private static func testNativeIdleClosesImmediately(_ c: CheckContext) {
+        let h = Harness()
+        h.beginChromecastPress()
+        h.doubao.emit(.active)
+        h.advance(0.16)
+        h.endChromecastPress()
+        c.expect(h.coordinator.debugSnapshot.phase == "open", "native active opens")
+        h.doubao.emit(.inactive)
+        c.expect(
+            h.coordinator.debugSnapshot.phase == "closed",
+            "native idle closes immediately"
+        )
+    }
+
+    /// macOS 13 fallback path: the device list can flicker, so an idle
+    /// snapshot is confirmed once before the session is torn down.
+    private static func testFallbackIdleIsDebounced(_ c: CheckContext) {
+        let h = Harness(usesDeviceListFallback: true)
+        h.beginChromecastPress()
+        h.doubao.emit(.active)
+        h.advance(0.16)
+        h.endChromecastPress()
+        c.expect(h.coordinator.debugSnapshot.phase == "open", "fallback active opens")
+
+        h.doubao.emit(.inactive)
+        c.expect(
+            h.coordinator.debugSnapshot.phase == "open",
+            "fallback idle waits for confirmation"
+        )
+        h.doubao.emit(.active)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.45))
+        c.expect(
+            h.coordinator.debugSnapshot.phase == "open",
+            "fallback idle flicker is ignored"
+        )
+
+        h.doubao.emit(.inactive)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.45))
+        c.expect(
+            h.coordinator.debugSnapshot.phase == "closed",
+            "fallback idle closes after confirmation"
+        )
+    }
+
+    private static func testNeverStartingSessionCloses(_ c: CheckContext) {
+        let h = Harness()
+        h.beginChromecastPress()
+        h.advance(0.16)
+        h.endChromecastPress()
+        c.expect(h.coordinator.debugSnapshot.phase == "opening", "session waits in opening")
+        RunLoop.current.run(until: Date().addingTimeInterval(3.2))
+        c.expect(
+            h.coordinator.debugSnapshot.phase == "closed",
+            "session that never records closes after retries"
+        )
+    }
+
+    /// A bound process object with an unreadable state is the macOS 13 case
+    /// that used to cut every dictation off after one second.
+    private static func testUnreadableStateKeepsSession(_ c: CheckContext) {
+        let h = Harness(initialState: .unavailable)
+        h.beginChromecastPress()
+        h.advance(0.16)
+        h.endChromecastPress()
+        RunLoop.current.run(until: Date().addingTimeInterval(3.2))
+        c.expect(
+            h.coordinator.debugSnapshot.phase == "open",
+            "unreadable state keeps the session open"
+        )
+    }
+
+    /// No pid and no process object means Doubao is not running at all; that
+    /// keeps the original close behaviour.
+    private static func testMissingProcessObjectCloses(_ c: CheckContext) {
+        let h = Harness(
+            initialState: .unavailable,
+            processObjectID: nil,
+            pid: nil
+        )
+        h.beginChromecastPress()
+        h.advance(0.16)
+        h.endChromecastPress()
+        RunLoop.current.run(until: Date().addingTimeInterval(3.2))
+        c.expect(
+            h.coordinator.debugSnapshot.phase == "closed",
+            "no Doubao process still closes"
+        )
+    }
+
+    /// Doubao runs, but this system cannot bind a process object at all
+    /// (possible on macOS 12). Never close on that basis.
+    private static func testUnbindableProcessKeepsSession(_ c: CheckContext) {
+        let h = Harness(
+            initialState: .unavailable,
+            processObjectID: nil,
+            pid: 123
+        )
+        h.beginChromecastPress()
+        h.advance(0.16)
+        h.endChromecastPress()
+        RunLoop.current.run(until: Date().addingTimeInterval(3.2))
+        c.expect(
+            h.coordinator.debugSnapshot.phase == "open",
+            "running but unbindable Doubao keeps the session"
         )
     }
 }
