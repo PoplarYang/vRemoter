@@ -134,7 +134,20 @@ final class X6HIDBridge {
         let openOptions = remappingEnabled
             ? IOOptionBits(kIOHIDOptionsTypeSeizeDevice)
             : IOOptionBits(kIOHIDOptionsTypeNone)
-        let result = IOHIDManagerOpen(manager, openOptions)
+        var result = IOHIDManagerOpen(manager, openOptions)
+        if result == kIOReturnNotPrivileged, remappingEnabled {
+            // macOS 只允许特权客户端抢占主用途为键盘的 HID 设备，
+            // 遥控器不在其列。此时退回共享模式，映射仍然生效，
+            // 只是设备原生的按键动作不再被拦截。
+            print(
+                "[X6] HID seize not permitted; " +
+                "falling back to shared mode (native actions not suppressed)"
+            )
+            result = IOHIDManagerOpen(
+                manager,
+                IOOptionBits(kIOHIDOptionsTypeNone)
+            )
+        }
         guard result == kIOReturnSuccess else {
             print(
                 "[X6] HID manager open failed: 0x" +

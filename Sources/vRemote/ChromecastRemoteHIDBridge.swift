@@ -105,7 +105,19 @@ final class ChromecastRemoteHIDBridge {
         let openOptions = remappingEnabled
             ? IOOptionBits(kIOHIDOptionsTypeSeizeDevice)
             : IOOptionBits(kIOHIDOptionsTypeNone)
-        let result = IOHIDManagerOpen(manager, openOptions)
+        var result = IOHIDManagerOpen(manager, openOptions)
+        if result == kIOReturnNotPrivileged, remappingEnabled {
+            // 同 X6Bridge：抢占失败时退回共享模式，映射保留，
+            // 设备原生动作（例如确认键唤起 Apple Music）不再被拦截。
+            print(
+                "[CAST-HID] seize not permitted; " +
+                "falling back to shared mode (native actions not suppressed)"
+            )
+            result = IOHIDManagerOpen(
+                manager,
+                IOOptionBits(kIOHIDOptionsTypeNone)
+            )
+        }
         guard result == kIOReturnSuccess else {
             print(
                 "[CAST-HID] manager open failed: " +
