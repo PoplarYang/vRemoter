@@ -433,10 +433,16 @@ private struct VersionUpdateView: View {
                 .font(.system(size: 28, weight: .semibold))
                 .foregroundStyle(UpdateTheme.text)
                 .padding(.top, 18)
-            Text(L10n.text("版本 \(model.currentVersion)", "Version \(model.currentVersion)"))
+            Text(L10n.text("版本 \(BuildInfo.short)", "Version \(BuildInfo.short)"))
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(UpdateTheme.secondary)
                 .padding(.top, 6)
+            if let buildLine = BuildInfo.buildLine {
+                Text(buildLine)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(UpdateTheme.secondary)
+                    .padding(.top, 2)
+            }
             Spacer()
             Button {
                 model.checkManually()

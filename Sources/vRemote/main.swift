@@ -73,10 +73,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Keep one continuous diagnostic history while X6 is being tuned.
         // Log.swift rotates at 5 MB; only the explicit menu action clears it.
         Log.setEnabled(true)
-        let appVersion = Bundle.main.object(
-            forInfoDictionaryKey: "CFBundleShortVersionString"
-        ) as? String ?? "development"
-        print("[APP] ===== vRemoter \(appVersion) started =====")
+        print("[APP] ===== vRemoter \(BuildInfo.short) started =====")
+        if let buildLine = BuildInfo.buildLine {
+            print("[APP] \(buildLine)")
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let statusImage = LogoAsset.image.copy() as? NSImage
@@ -113,6 +113,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(makeLanguageMenu())
 
         menu.addItem(.separator())
+        // 版本号常驻菜单，避免「装的到底是哪个包」靠猜。
+        let versionItem = NSMenuItem(
+            title: BuildInfo.menuTitle,
+            action: nil,
+            keyEquivalent: ""
+        )
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
+
         let updates = NSMenuItem(
             title: L10n.text("版本与更新…", "Version & Updates…"),
             action: #selector(openVersionUpdates),
@@ -496,7 +505,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             statusText = L10n.text("等待遥控器", "Waiting for remote")
         }
-        statusItem.button?.toolTip = "vRemoter · \(statusText)"
+        statusItem.button?.toolTip = "vRemoter \(BuildInfo.short) · \(statusText)"
         headerLabel.title = L10n.text("状态 · \(statusText)", "Status · \(statusText)")
         debugWindow.update(
             status: statusText,

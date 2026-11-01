@@ -635,6 +635,10 @@ private struct StudioMixerView: View {
                 Text(L10n.text("双麦语音输入", "Dual microphone input"))
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(ConsoleTheme.secondary)
+                Text(BuildInfo.compactTitle)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(ConsoleTheme.tertiary)
+                    .help(BuildInfo.buildLine ?? BuildInfo.compactTitle)
             }
             ConsolePageSelector(selection: $model.selectedPage)
                 .frame(width: 202)
