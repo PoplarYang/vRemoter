@@ -1,6 +1,14 @@
 import CoreGraphics
 import Foundation
 
+/// A modifier key used as the voice trigger.
+///
+/// Option and Command exist on both sides of a full keyboard. This app always
+/// presses the **left** one, and says so in the title, because that is the key
+/// most people bind and because a silent mismatch ("I picked Option, nothing
+/// happens") is the worst failure mode. The synthetic event also carries the
+/// device-dependent "left side" bit, so an input method that records the side
+/// sees a matching key; one that ignores the side behaves as it always did.
 enum InputTriggerKey: String, CaseIterable, Identifiable {
     case option
     case command
@@ -12,26 +20,47 @@ enum InputTriggerKey: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .option: "Option (⌥)"
-        case .command: "Command (⌘)"
-        case .control: "Control (⌃)"
-        case .shift: "Shift (⇧)"
+        case .option: L10n.text("Option ⌥（左键）", "Option ⌥ (left key)")
+        case .command: L10n.text("Command ⌘（左键）", "Command ⌘ (left key)")
+        case .control: L10n.text("Control ⌃", "Control ⌃")
+        case .shift: L10n.text("Shift ⇧", "Shift ⇧")
         case .function: "Fn / Globe"
         }
     }
 
+    /// Whether the title already states which physical key is sent.
+    var statesSide: Bool {
+        switch self {
+        case .option, .command: true
+        case .control, .shift, .function: false
+        }
+    }
+
+    /// Physical key codes that wake the trigger.
+    ///
+    /// Option and Command accept only the left key: the right one would fire a
+    /// trigger this app then presses on the left, which only confuses a user
+    /// whose input method is bound to the right key. Control and Shift keep
+    /// both sides, since neither is ever bound per-side for dictation.
     var keyCodes: Set<Int64> {
         switch self {
-        case .option: [0x3A, 0x3D]
-        case .command: [0x37, 0x36]
+        case .option: [0x3A]
+        case .command: [0x37]
         case .control: [0x3B, 0x3E]
         case .shift: [0x38, 0x3C]
         case .function: [0x3F]
         }
     }
 
+    /// The key code we synthesise when the remote asks for this trigger.
     var primaryKeyCode: CGKeyCode {
-        CGKeyCode(keyCodes.min() ?? 0x3A)
+        switch self {
+        case .option: 0x3A
+        case .command: 0x37
+        case .control: 0x3B
+        case .shift: 0x38
+        case .function: 0x3F
+        }
     }
 
     var flag: CGEventFlags {
@@ -42,6 +71,26 @@ enum InputTriggerKey: String, CaseIterable, Identifiable {
         case .shift: .maskShift
         case .function: .maskSecondaryFn
         }
+    }
+
+    /// The "left side" bit (`NX_DEVICE*KEYMASK`) posted with the key-down.
+    ///
+    /// Sent on top of the device-independent flag above. Input methods that
+    /// compare only `deviceIndependentFlagsMask` ignore it and behave exactly
+    /// as before; input methods that keep the side see the left key.
+    var deviceFlag: UInt64 {
+        switch self {
+        case .option: 0x0000_0020 // NX_DEVICELALTKEYMASK
+        case .command: 0x0000_0008 // NX_DEVICELCMDKEYMASK
+        case .control: 0x0000_0001 // NX_DEVICELCTLKEYMASK
+        case .shift: 0x0000_0002 // NX_DEVICELSHIFTKEYMASK
+        case .function: 0
+        }
+    }
+
+    /// Flags posted with the synthetic key-down.
+    var combinedFlags: CGEventFlags {
+        CGEventFlags(rawValue: flag.rawValue | deviceFlag)
     }
 
     /// 用户配置 + 实际选中的输入法 → 真正要按的键。
@@ -125,7 +174,7 @@ enum Key {
             virtualKey: trigger.primaryKeyCode,
             keyDown: keyDown
         ) else { return }
-        event.flags = keyDown ? trigger.flag : []
+        event.flags = keyDown ? trigger.combinedFlags : []
         event.setIntegerValueField(.eventSourceUserData, value: syntheticMarker)
         event.post(tap: .cghidEventTap)
         print(

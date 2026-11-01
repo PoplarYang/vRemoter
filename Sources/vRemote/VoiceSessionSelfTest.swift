@@ -208,6 +208,7 @@ enum VoiceSessionSelfTest {
         testForceCloseReleasesHeldTrigger(checks)
         testPushToTalkDoesNotKeepMicrophoneOpen(checks)
         testTriggerDefaultsFollowInputMethod(checks)
+        testTriggerKeySides(checks)
         testAudioRouteSwitchesInput(checks)
         testAudioRouteRestoresOnStop(checks)
         testAudioRouteSettlesLeftoverAfterCrash(checks)
@@ -625,6 +626,51 @@ enum VoiceSessionSelfTest {
                 configured: .pushToTalk, host: .automatic, currentInputSource: weType
             ) == .pushToTalk,
             "an explicitly chosen trigger style is never overridden"
+        )
+    }
+
+    // MARK: - 触发键的左右侧
+
+    /// Option / Command 在键盘上分左右。程序固定发左侧，且合成事件里带上
+    /// 「左侧」这个 device-dependent 位；监听只认左侧，避免「按右也触发、
+    /// 但输入法认的是右」这种只有用户能感觉到的错位。
+    private static func testTriggerKeySides(_ c: CheckContext) {
+        c.expect(
+            InputTriggerKey.option.primaryKeyCode == 0x3A,
+            "Option presses the left key (0x3A)"
+        )
+        c.expect(
+            InputTriggerKey.command.primaryKeyCode == 0x37,
+            "Command presses the left key (0x37), not the right 0x36"
+        )
+        c.expect(
+            InputTriggerKey.option.combinedFlags.contains(.maskAlternate),
+            "Option keeps the device-independent alternate flag"
+        )
+        c.expect(
+            InputTriggerKey.option.deviceFlag == 0x20,
+            "Option marks the left side (NX_DEVICELALTKEYMASK)"
+        )
+        c.expect(
+            InputTriggerKey.command.deviceFlag == 0x08,
+            "Command marks the left side (NX_DEVICELCMDKEYMASK)"
+        )
+        c.expect(
+            !InputTriggerKey.option.keyCodes.contains(0x3D),
+            "the right Option no longer wakes the trigger"
+        )
+        c.expect(
+            !InputTriggerKey.command.keyCodes.contains(0x36),
+            "the right Command no longer wakes the trigger"
+        )
+        c.expect(
+            InputTriggerKey.control.keyCodes.contains(0x3E)
+                && InputTriggerKey.shift.keyCodes.contains(0x3C),
+            "Control and Shift still accept either side"
+        )
+        c.expect(
+            InputTriggerKey.function.deviceFlag == 0,
+            "Fn carries no side bit"
         )
     }
 

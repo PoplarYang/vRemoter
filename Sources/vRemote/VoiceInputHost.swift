@@ -26,22 +26,45 @@ enum VoiceTriggerStyle: String, CaseIterable, Identifiable {
         }
     }
 
+    /// One line that names the input method this style belongs to. Shown
+    /// under the picker so the choice is not a guess.
     var detail: String {
         switch self {
         case .tapToggle:
             L10n.text(
-                "按一下开始，再按一下结束。",
-                "Tap once to start, tap again to stop."
+                "按一下开始，再按一下结束 · 豆包输入法的默认方式",
+                "Tap to start, tap again to stop · Doubao's default"
             )
         case .pushToTalk:
             L10n.text(
-                "按住遥控器语音键说话，松开结束。",
-                "Hold the remote voice key while talking."
+                "按住说话，松开即结束 · 对讲机式，不会忘记关闭",
+                "Hold to talk, release to stop · walkie-talkie style"
             )
         case .pushToTalkLatching:
             L10n.text(
-                "按住说话、松开结束；短按一次锁定继续录音，再短按结束。",
-                "Hold to talk; a short tap latches, another tap stops."
+                "按住说话；短按一次可松手继续录，再短按结束 · 微信输入法",
+                "Hold to talk; a short tap keeps recording, another tap stops · WeChat"
+            )
+        }
+    }
+
+    /// Longer explanation for the help popover.
+    var scenario: String {
+        switch self {
+        case .tapToggle:
+            L10n.text(
+                "遥控器短按一次开始录音，再短按一次结束。适合豆包输入法，也适合需要长时间口述、不想一直按着的场景。",
+                "A short remote press starts, another stops. Suits Doubao and long dictation."
+            )
+        case .pushToTalk:
+            L10n.text(
+                "按住遥控器语音键说话，松开就结束。和微信语音、对讲机一样，绝不会忘记关闭麦克风，但长句子要一直按着。",
+                "Hold the remote voice key while talking. Nothing is left recording."
+            )
+        case .pushToTalkLatching:
+            L10n.text(
+                "默认按住说话、松开结束；如果只想说一句就松手，快速短按一次会让微信输入法进入免手扶模式继续录音，再短按一次结束。适合长段落口述。",
+                "Hold to talk, release to stop. A quick tap latches WeChat's hands-free mode; tap again to end."
             )
         }
     }

@@ -900,9 +900,17 @@ private struct KeyMappingView: View {
         }
     }
 
+    /// 触发方式的一行说明，前面缀上「左键」提示——只有 Option / Command
+    /// 需要，因为只有它们分左右。
+    private var triggerHintText: String {
+        let detail = model.voiceTriggerStyle.detail
+        guard model.inputTriggerKey.statesSide else { return detail }
+        return L10n.text("触发键固定发送左侧 · ", "Left key only · ") + detail
+    }
+
     private var triggerPanel: some View {
         HStack(spacing: 18) {
-            VStack(alignment: .leading, spacing: 7) {
+            VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 7) {
                     Image(systemName: "waveform.badge.mic")
                         .foregroundStyle(ConsoleTheme.green)
@@ -910,25 +918,35 @@ private struct KeyMappingView: View {
                         .font(.system(size: 17, weight: .semibold))
                         .foregroundStyle(ConsoleTheme.text)
                 }
-                Text(L10n.text(
-                    "选择遥控器要驱动的输入法。遥控器语音键与电脑键盘共用同一个触发键，它必须与该输入法里的语音快捷键一致。",
-                    "Choose the input method the remote drives. The remote voice key and the Mac keyboard share one trigger, which must match that input method's voice shortcut."
-                ))
-                    .font(.system(size: 12.5))
+                Text(
+                    model.voiceInputHost == .weType
+                        ? L10n.text(
+                            "微信输入法：语音设置里可直接选 vRemoteDr 2ch，或打开菜单里的自动切换。",
+                            "WeChat input: pick vRemoteDr 2ch in its voice settings, or enable auto-switch in the menu."
+                        )
+                        : L10n.text(
+                            "遥控器语音键与键盘共用此键，须与输入法里的语音快捷键一致。",
+                            "The remote and keyboard share this trigger; it must match the input method's voice shortcut."
+                        )
+                )
+                    .font(.system(size: 12))
                     .foregroundStyle(ConsoleTheme.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                if model.voiceInputHost == .weType {
-                    Label(
-                        L10n.text(
-                            "微信输入法：语音设置里可直接选 vRemoteDr 2ch；打开菜单里的自动切换也可以。",
-                            "WeChat input: pick vRemoteDr 2ch in its voice settings, or enable auto-switch in the menu."
-                        ),
-                        systemImage: "info.circle.fill"
+                    .help(model.voiceInputHost == .weType
+                        ? L10n.text(
+                            "微信输入法 2.2.3 起支持自选麦克风。若已在那里指定过设备，就以那里为准。",
+                            "WeChat input can pick its own microphone since 2.2.3."
+                        )
+                        : L10n.text(
+                            "自动检测模式下，这个键会跟着系统当前选中的输入法走（豆包 Option、微信 Fn）。",
+                            "In automatic mode the trigger follows the active input method."
+                        )
                     )
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(ConsoleTheme.amber)
+                Label(triggerHintText, systemImage: "info.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(ConsoleTheme.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
-                }
+                    .help(model.voiceTriggerStyle.scenario)
             }
             Spacer(minLength: 10)
             VStack(alignment: .trailing, spacing: 5) {
@@ -961,6 +979,10 @@ private struct KeyMappingView: View {
                 .labelsHidden()
                 .frame(width: 168)
                 .disabled(model.remoteStreaming)
+                .help(L10n.text(
+                    "本程序固定发送左侧的 Option / Command。若输入法里绑的是右侧，请在输入法里改绑左侧。",
+                    "Always sends the left Option / Command. Rebind in the input method if it uses the right key."
+                ))
 
                 Picker(
                     L10n.text("触发方式", "Trigger style"),
