@@ -20,6 +20,22 @@ ditto "$SCRIPT_DIR/dist/build/vRemote.app" "$PAYLOAD_ROOT/Applications/vRemote.a
 ditto "$SCRIPT_DIR/Driver/build/vRemoteDriver.driver" \
   "$PAYLOAD_ROOT/Library/Audio/Plug-Ins/HAL/vRemoteDriver.driver"
 
+# 架构门：确认 APP 与驱动都带上了要求的 slice，否则不要出包。
+# 默认只卡 Intel（历史上 1.1.1 就是因为漏了它，在 Intel Mac 上无法启动）。
+# 出通用包时用 VR_REQUIRED_ARCHS="x86_64 arm64"。
+REQUIRED_ARCHS="${VR_REQUIRED_ARCHS:-x86_64}"
+for arch in ${=REQUIRED_ARCHS}; do
+  for binary in \
+    "$PAYLOAD_ROOT/Applications/vRemote.app/Contents/MacOS/vRemote" \
+    "$PAYLOAD_ROOT/Library/Audio/Plug-Ins/HAL/vRemoteDriver.driver/Contents/MacOS/BlackHole"
+  do
+    if ! lipo -archs "$binary" 2>/dev/null | grep -qw "$arch"; then
+      print -u2 "Error: ${binary:t} is missing $arch"
+      exit 1
+    fi
+  done
+done
+
 pkgbuild \
   --root "$PAYLOAD_ROOT" \
   --scripts "$SCRIPT_DIR/Packaging/pkg-scripts" \
